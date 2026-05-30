@@ -1,22 +1,15 @@
 #!/bin/bash
-# Универсальный установщик сервисов v2.2 (FIXED)
-# Запуск: см. инструкции ниже
+# Универсальный установщик сервисов v3.1
+# Запуск: curl -fsSL https://raw.githubusercontent.com/Pavel-work/installer_docker/main/install.sh -o install.sh && sudo bash install.sh
 
-# === === Обработка pipe-запуска (ИСПРАВЛЕНО) === ===
-# Используем процессную подстановку вместо cat, чтобы избежать deadlock
+# === Обработка pipe-запуска ===
 if [ ! -t 0 ] && [ -z "$SCRIPT_SELF_EXECUTED" ]; then
   export SCRIPT_SELF_EXECUTED=1
   exec bash <(cat) "$@"
 fi
 
-# Отключаем строгий режим для лучшей совместимости с dialog
-# set -euo pipefail  # <- закомментировано для отладки
-
 # Цвета
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC='\033[0m'
 
 # === Глобальные переменные ===
 STATE_DIR="/root/.server-setup-state"
@@ -27,68 +20,110 @@ SETUP_DIR="/root/server-setup"
 TEMP_FILE=$(mktemp)
 REAL_USER="${SUDO_USER:-$USER}"
 
-cleanup() { rm -f "$TEMP_FILE" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
+declare -a CREATED_CONTAINERS=()
+declare -a CREATED_VOLUMES=()
+declare -a CREATED_NETWORKS=()
+
+cleanup_temp() { rm -f "$TEMP_FILE" 2>/dev/null || true; }
+trap cleanup_temp EXIT INT TERM
 
 save_state() { mkdir -p "$STATE_DIR" 2>/dev/null; echo "$1" > "$STATE_FILE"; }
 get_state() { [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || echo "start"; }
 
-save_selected_services() {
+save_selected() {
   mkdir -p "$STATE_DIR" 2>/dev/null
   printf '%s\n' "${SELECTED_ARRAY[@]}" > "$SELECTED_FILE"
 }
 
-load_selected_services() {
+load_selected() {
   SELECTED_ARRAY=()
-  # ИСПРАВЛЕНО: фильтр пустых строк + безопасный mapfile
-  if [[ -f "$SELECTED_FILE" ]]; then
-    while IFS= read -r line; do
-      [[ -n "$line" ]] && SELECTED_ARRAY+=("$line")
-    done < "$SELECTED_FILE"
-  fi
+  [[ -f "$SELECTED_FILE" ]] && while IFS= read -r line; do
+    [[ -n "$line" ]] && SELECTED_ARRAY+=("$line")
+  done < "$SELECTED_FILE"
 }
 
 save_params() {
   mkdir -p "$STATE_DIR" 2>/dev/null
   cat > "$PARAMS_FILE" <<EOF
+# Auto-generated $(date)
 PGPASSWORD=${PGPASSWORD@Q}
 JWT_SECRET=${JWT_SECRET@Q}
+SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY@Q}
+SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY@Q}
+SUPABASE_DASHBOARD_PASS=${SUPABASE_DASHBOARD_PASS@Q}
 LLM_TYPE=${LLM_TYPE@Q}
 LLM_API_KEY=${LLM_API_KEY@Q}
 LLM_API_URL=${LLM_API_URL@Q}
-DOMAIN=${DOMAIN@Q}
-SUPABASE_DOMAIN=${SUPABASE_DOMAIN@Q}
-N8N_PORT=${N8N_PORT@Q}
-N8N_DB_POSTGRES=${N8N_DB_POSTGRES@Q}
-APACHE_WWW_PATH=${APACHE_WWW_PATH@Q}
-APACHE_HTTP_PORT=${APACHE_HTTP_PORT@Q}
-QDRANT_PORT=${QDRANT_PORT@Q}
-OLLAMA_PORT=${OLLAMA_PORT@Q}
+DOMAIN_MAIN=${DOMAIN_MAIN@Q}
+NPM_ENABLED=${NPM_ENABLED@Q}
+NPM_ADMIN_EMAIL=${NPM_ADMIN_EMAIL@Q}
+NPM_ADMIN_PASS=${NPM_ADMIN_PASS@Q}
+POSTGRES_USER=${POSTGRES_USER@Q}
 EOF
+  # Сохраняем порты и домены для каждого сервиса
+  for svc in n8n apache qdrant ollama portainer supabase; do
+    local port_var="${svc^^}_PORT"
+    local domain_var="${svc^^}_DOMAIN"
+    [[ -n "${!port_var:-}" ]] && echo "${port_var}=${!port_var@Q}" >> "$PARAMS_FILE"
+    [[ -n "${!domain_var:-}" ]] && echo "${domain_var}=${!domain_var@Q}" >> "$PARAMS_FILE"
+  done
+  [[ -n "${APACHE_WWW_PATH:-}" ]] && echo "APACHE_WWW_PATH=${APACHE_WWW_PATH@Q}" >> "$PARAMS_FILE"
+  [[ -n "${N8N_DB_POSTGRES:-}" ]] && echo "N8N_DB_POSTGRES=${N8N_DB_POSTGRES@Q}" >> "$PARAMS_FILE"
   chmod 600 "$PARAMS_FILE" 2>/dev/null || true
 }
 
 load_params() {
   [[ -f "$PARAMS_FILE" ]] && source "$PARAMS_FILE"
-  PGPASSWORD="${PGPASSWORD:-}"
-  JWT_SECRET="${JWT_SECRET:-}"
-  LLM_TYPE="${LLM_TYPE:-}"
-  LLM_API_KEY="${LLM_API_KEY:-}"
-  LLM_API_URL="${LLM_API_URL:-}"
-  DOMAIN="${DOMAIN:-}"
-  SUPABASE_DOMAIN="${SUPABASE_DOMAIN:-}"
-  N8N_PORT="${N8N_PORT:-5678}"
-  N8N_DB_POSTGRES="${N8N_DB_POSTGRES:-0}"
+  PGPASSWORD="${PGPASSWORD:-}"; JWT_SECRET="${JWT_SECRET:-}"
+  SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY:-}"; SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
+  SUPABASE_DASHBOARD_PASS="${SUPABASE_DASHBOARD_PASS:-}"
+  LLM_TYPE="${LLM_TYPE:-ollama}"; LLM_API_KEY="${LLM_API_KEY:-}"
+  LLM_API_URL="${LLM_API_URL:-}"; DOMAIN_MAIN="${DOMAIN_MAIN:-}"
+  NPM_ENABLED="${NPM_ENABLED:-0}"
+  NPM_ADMIN_EMAIL="${NPM_ADMIN_EMAIL:-admin@example.com}"
+  NPM_ADMIN_PASS="${NPM_ADMIN_PASS:-changeme}"
+  POSTGRES_USER="${POSTGRES_USER:-admin}"
+  N8N_PORT="${N8N_PORT:-5678}"; N8N_DOMAIN="${N8N_DOMAIN:-}"
+  APACHE_PORT="${APACHE_PORT:-8080}"; APACHE_DOMAIN="${APACHE_DOMAIN:-}"
   APACHE_WWW_PATH="${APACHE_WWW_PATH:-$SETUP_DIR/www}"
-  APACHE_HTTP_PORT="${APACHE_HTTP_PORT:-8080}"
-  QDRANT_PORT="${QDRANT_PORT:-6333}"
-  OLLAMA_PORT="${OLLAMA_PORT:-11434}"
+  QDRANT_PORT="${QDRANT_PORT:-6333}"; QDRANT_DOMAIN="${QDRANT_DOMAIN:-}"
+  OLLAMA_PORT="${OLLAMA_PORT:-11434}"; OLLAMA_DOMAIN="${OLLAMA_DOMAIN:-}"
+  PORTAINER_DOMAIN="${PORTAINER_DOMAIN:-}"
+  SUPABASE_DOMAIN="${SUPABASE_DOMAIN:-}"
+  N8N_DB_POSTGRES="${N8N_DB_POSTGRES:-0}"
+}
+
+# === 🔑 Безопасный ввод с поддержкой @file ===
+read_with_hint() {
+  local prompt="$1" default="$2" var_name="$3" is_password="${4:-0}"
+  local hint=$'\n[Shift+Insert или ПКМ для вставки]\n[ИЛИ: @/путь/к/файлу - загрузить из файла]\n[Tab - навигация]'
+  
+  while true; do
+    local dialog_type="--inputbox"
+    [[ "$is_password" -eq 1 ]] && dialog_type="--passwordbox"
+    dialog --clear --title "Ввод" $dialog_type "$prompt$hint" 16 70 "$default" 2>"$TEMP_FILE"
+    local res=$?
+    [[ $res -ne 0 ]] && return $res
+    local val=$(cat "$TEMP_FILE")
+    if [[ "$val" =~ ^@(.+)$ ]]; then
+      local fpath="${BASH_REMATCH[1]}"
+      if [[ -r "$fpath" ]]; then
+        val=$(<"$fpath")
+        dialog --msgbox "✅ Загружено из $fpath" 6 50
+      else
+        dialog --msgbox "❌ Файл не найден: $fpath" 6 50
+        continue
+      fi
+    fi
+    eval "$var_name=\$val"
+    return 0
+  done
 }
 
 check_port() {
   local port=$1
   if command -v ss &>/dev/null && ss -Htuln sport = :$port 2>/dev/null | grep -q .; then
-    dialog --title "Ошибка" --msgbox "Порт $port уже занят." 6 50
+    dialog --title "Ошибка" --msgbox "Порт $port занят." 6 40
     return 1
   fi
   return 0
@@ -107,20 +142,17 @@ install_docker() {
   fi
 }
 
-# Подсказка для ввода (Shift+Insert для вставки!)
-INPUT_HINT=$'\n[Вставка: Shift+Insert или ПКМ]\n[Копирование: выделить мышью]\n[Tab - навигация]'
-
-# === 1. Меню сервисов ===
+# === 1. Выбор сервисов ===
 show_service_menu() {
   local args=(
-    "postgres" "PostgreSQL" "off"
-    "qdrant" "Qdrant" "off"
-    "ollama" "Ollama" "off"
-    "apache" "Apache" "off"
-    "nginx_proxy" "Nginx Proxy Manager" "off"
-    "portainer" "Portainer" "off"
-    "supabase" "Supabase" "off"
-    "n8n" "n8n" "off"
+    "postgres" "PostgreSQL (БД)" "off"
+    "qdrant" "Qdrant (векторная БД)" "off"
+    "ollama" "Ollama (локальные LLM)" "off"
+    "apache" "Apache (веб-сервер)" "off"
+    "nginx_proxy" "Nginx Proxy Manager (SSL)" "off"
+    "portainer" "Portainer (Docker UI)" "off"
+    "supabase" "Supabase (BaaS)" "off"
+    "n8n" "n8n (автоматизация)" "off"
   )
   if [ ${#SELECTED_ARRAY[@]} -gt 0 ]; then
     for ((i=0; i<${#args[@]}; i+=3)); do
@@ -129,173 +161,145 @@ show_service_menu() {
       done
     done
   fi
-  dialog --clear --title "Шаг 1: Выбор сервисов" \
-    --extra-button --extra-label "Выход" --ok-label "Далее" \
-    --checklist "Выберите (Пробел=выбор, Enter=далее)$INPUT_HINT" 22 70 10 \
-    "${args[@]}" 2>"$TEMP_FILE"
+  dialog --clear --title "📦 Шаг 1: Выбор сервисов" \
+    --extra-button --extra-label "Выход" --ok-label "Далее ▶" \
+    --checklist "Пробел=выбор, Enter=далее" 20 70 10 "${args[@]}" 2>"$TEMP_FILE"
   local res=$?
   [[ $res -eq 1 || $res -eq 3 ]] && return 1
-  SELECTED=$(cat "$TEMP_FILE" 2>/dev/null)
   SELECTED_ARRAY=()
-  for item in $SELECTED; do
-    SELECTED_ARRAY+=("$(echo "$item" | tr -d '"')")
+  for item in $(cat "$TEMP_FILE" 2>/dev/null | tr -d '"'); do
+    SELECTED_ARRAY+=("$item")
   done
-  if [ ${#SELECTED_ARRAY[@]} -eq 0 ]; then
-    dialog --msgbox "Выберите хотя бы один сервис." 6 50
-    return 1
+  [[ ${#SELECTED_ARRAY[@]} -eq 0 ]] && { dialog --msgbox "⚠ Выберите хотя бы один сервис." 6 50; return 1; }
+  save_selected
+  return 0
+}
+
+# === 2. Условные параметры ===
+input_parameters() {
+  POSTGRES_USER="admin"
+  
+  # Postgres пароль (нужен для postgres/supabase/n8n)
+  if [[ " ${SELECTED_ARRAY[*]} " =~ "postgres" || " ${SELECTED_ARRAY[*]} " =~ "supabase" || " ${SELECTED_ARRAY[*]} " =~ "n8n" ]]; then
+    while true; do
+      read_with_hint "🔐 Пароль PostgreSQL (admin):" "$PGPASSWORD" "PGPASSWORD" 1 || return 1
+      [[ -n "$PGPASSWORD" ]] && break
+      PGPASSWORD=$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-20)
+      dialog --msgbox "🎲 Сгенерирован: $PGPASSWORD" 8 60
+      break
+    done
   fi
-  save_selected_services
-  return 0
-}
-
-# === 2. Параметры ===
-step_postgres() {
-  dialog --clear --title "Шаг 2: PostgreSQL" \
-    --extra-button --extra-label "Назад" --ok-label "Далее" \
-    --inputbox "Пароль admin (пусто = авто)$INPUT_HINT" 14 70 "$PGPASSWORD" 2>"$TEMP_FILE"
-  local res=$?
-  [[ $res -eq 1 || $res -eq 3 ]] && return 1
-  PGPASSWORD=$(cat "$TEMP_FILE")
-  if [ -z "$PGPASSWORD" ]; then
-    PGPASSWORD=$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-20)
-    dialog --msgbox "Сгенерирован: $PGPASSWORD" 8 60
+  
+  # Supabase (только если выбран)
+  if [[ " ${SELECTED_ARRAY[*]} " =~ "supabase" ]]; then
+    read_with_hint "🔑 JWT Secret (пусто = авто):" "$JWT_SECRET" "JWT_SECRET" 1 || return 1
+    [[ -z "$JWT_SECRET" ]] && JWT_SECRET=$(openssl rand -hex 32)
+    dialog --clear --title "🌐 Supabase" --inputbox "Поддомен Supabase (пусто = без):" 10 70 "$SUPABASE_DOMAIN" 2>"$TEMP_FILE"
+    [[ $? -ne 0 ]] && return 1
+    SUPABASE_DOMAIN=$(cat "$TEMP_FILE")
   fi
-  return 0
-}
-
-step_jwt() {
-  dialog --clear --title "Шаг 3: JWT Secret" \
-    --extra-button --extra-label "Назад" --ok-label "Далее" \
-    --inputbox "JWT Secret (пусто = авто)$INPUT_HINT" 14 70 "$JWT_SECRET" 2>"$TEMP_FILE"
-  local res=$?
-  [[ $res -eq 1 || $res -eq 3 ]] && return 1
-  JWT_SECRET=$(cat "$TEMP_FILE")
-  [ -z "$JWT_SECRET" ] && JWT_SECRET=$(openssl rand -hex 32)
-  return 0
-}
-
-step_llm() {
-  dialog --clear --title "Шаг 4: LLM" \
-    --extra-button --extra-label "Назад" --ok-label "Далее" \
-    --radiolist "Провайдер:" 15 60 4 \
-    "ollama" "Ollama (локально)" on "openai" "OpenAI" off "anthropic" "Anthropic" off \
-    2>"$TEMP_FILE"
-  local res=$?
-  [[ $res -eq 1 || $res -eq 3 ]] && return 1
-  LLM_TYPE=$(cat "$TEMP_FILE")
-  case "$LLM_TYPE" in
-    openai)
-      dialog --extra-button --extra-label "Назад" --ok-label "Далее" \
-        --passwordbox "OpenAI API key$INPUT_HINT" 12 70 2>"$TEMP_FILE"
-      [[ $? -eq 3 ]] && return 1
-      LLM_API_KEY=$(cat "$TEMP_FILE"); LLM_API_URL="https://api.openai.com/v1" ;;
-    anthropic)
-      dialog --extra-button --extra-label "Назад" --ok-label "Далее" \
-        --passwordbox "Anthropic API key$INPUT_HINT" 12 70 2>"$TEMP_FILE"
-      [[ $? -eq 3 ]] && return 1
-      LLM_API_KEY=$(cat "$TEMP_FILE"); LLM_API_URL="https://api.anthropic.com/v1" ;;
-    ollama) LLM_API_URL="http://ollama:11434" ;;
-  esac
-  return 0
-}
-
-step_domain() {
-  dialog --clear --title "Шаг 5: Домены" \
-    --extra-button --extra-label "Назад" --ok-label "Далее" \
-    --form "Домены (можно пусто)$INPUT_HINT" 14 70 0 \
-    "Основной:" 1 2 "$DOMAIN" 1 20 40 0 \
-    "Supabase:" 3 2 "$SUPABASE_DOMAIN" 3 20 40 0 \
-    2>"$TEMP_FILE"
-  local res=$?
-  [[ $res -eq 1 || $res -eq 3 ]] && return 1
-  mapfile -t domains < "$TEMP_FILE"
-  DOMAIN="${domains[0]}"; SUPABASE_DOMAIN="${domains[1]}"
-  return 0
-}
-
-step_ports() {
-  while true; do
-    local form_args=() row=1
-    [[ " ${SELECTED_ARRAY[*]} " =~ "n8n" ]] && { form_args+=("n8n порт:" $row 2 "$N8N_PORT" $row 20 10 0); ((row+=2)); }
-    [[ " ${SELECTED_ARRAY[*]} " =~ "apache" ]] && { form_args+=("Apache порт:" $row 2 "$APACHE_HTTP_PORT" $row 20 10 0); ((row+=2)); }
-    [[ " ${SELECTED_ARRAY[*]} " =~ "qdrant" ]] && { form_args+=("Qdrant порт:" $row 2 "$QDRANT_PORT" $row 20 10 0); ((row+=2)); }
-    [[ " ${SELECTED_ARRAY[*]} " =~ "ollama" ]] && { form_args+=("Ollama порт:" $row 2 "$OLLAMA_PORT" $row 20 10 0); ((row+=2)); }
-    [ ${#form_args[@]} -eq 0 ] && break
-    local h=$((row+5)); [ $h -gt 20 ] && h=20
-    dialog --clear --title "Шаг 6: Порты" \
-      --extra-button --extra-label "Назад" --ok-label "Далее" \
-      --form "Порты$INPUT_HINT" $h 70 0 "${form_args[@]}" 2>"$TEMP_FILE"
-    local res=$?
-    [[ $res -eq 1 || $res -eq 3 ]] && return 1
-    mapfile -t ports < "$TEMP_FILE"
-    local idx=0 ok=true
-    [[ " ${SELECTED_ARRAY[*]} " =~ "n8n" ]] && { N8N_PORT="${ports[$idx]}"; check_port "$N8N_PORT" || ok=false; ((idx++)); }
-    [[ " ${SELECTED_ARRAY[*]} " =~ "apache" ]] && { APACHE_HTTP_PORT="${ports[$idx]}"; check_port "$APACHE_HTTP_PORT" || ok=false; ((idx++)); }
-    [[ " ${SELECTED_ARRAY[*]} " =~ "qdrant" ]] && { QDRANT_PORT="${ports[$idx]}"; check_port "$QDRANT_PORT" || ok=false; ((idx++)); }
-    [[ " ${SELECTED_ARRAY[*]} " =~ "ollama" ]] && { OLLAMA_PORT="${ports[$idx]}"; check_port "$OLLAMA_PORT" || ok=false; ((idx++)); }
-    $ok && break
+  
+  # NPM + домены
+  if [[ " ${SELECTED_ARRAY[*]} " =~ "nginx_proxy" ]]; then
+    NPM_ENABLED=1
+    dialog --clear --title "🌍 Основной домен" --inputbox "Домен (example.com):" 10 70 "$DOMAIN_MAIN" 2>"$TEMP_FILE"
+    [[ $? -ne 0 ]] && return 1
+    DOMAIN_MAIN=$(cat "$TEMP_FILE")
+    
+    if [[ -n "$DOMAIN_MAIN" ]]; then
+      for svc in n8n apache qdrant ollama portainer supabase; do
+        [[ ! " ${SELECTED_ARRAY[*]} " =~ "$svc" ]] && continue
+        local default_domain="${svc}.${DOMAIN_MAIN}"
+        [[ "$svc" == "nginx_proxy" ]] && continue
+        dialog --yesno "🔗 Проксировать $svc с SSL?\nДомен: $default_domain" 10 60 || continue
+        local domain_var="${svc^^}_DOMAIN"
+        eval "$domain_var=\$default_domain"
+      done
+    fi
+  fi
+  
+  # Порты (только если NPM не проксирует)
+  for svc in n8n apache qdrant ollama; do
+    [[ ! " ${SELECTED_ARRAY[*]} " =~ "$svc" ]] && continue
+    local port_var="${svc^^}_PORT"
+    local domain_var="${svc^^}_DOMAIN"
+    # Если NPM проксирует - порт наружу не публикуем
+    if [[ "$NPM_ENABLED" -eq 1 && -n "${!domain_var:-}" ]]; then
+      continue
+    fi
+    local default_port=""
+    case "$svc" in
+      n8n) default_port=5678 ;; apache) default_port=8080 ;;
+      qdrant) default_port=6333 ;; ollama) default_port=11434 ;;
+    esac
+    local current_port="${!port_var:-$default_port}"
+    while true; do
+      dialog --clear --title "🔌 Порт $svc" --inputbox "Порт для $svc:" 10 70 "$current_port" 2>"$TEMP_FILE"
+      [[ $? -ne 0 ]] && return 1
+      local new_port=$(cat "$TEMP_FILE")
+      check_port "$new_port" && { eval "$port_var=\$new_port"; break; }
+    done
   done
+  
+  # n8n + postgres
   if [[ " ${SELECTED_ARRAY[*]} " =~ "n8n" && " ${SELECTED_ARRAY[*]} " =~ "postgres" ]]; then
-    dialog --extra-button --extra-label "Назад" --ok-label "Далее" \
-      --yesno "n8n: использовать PostgreSQL?" 8 50
-    [[ $? -eq 3 ]] && return 1
+    dialog --yesno "💾 Использовать PostgreSQL для БД n8n?" 8 50
     [[ $? -eq 0 ]] && N8N_DB_POSTGRES=1 || N8N_DB_POSTGRES=0
   fi
+  
+  # Apache path
   if [[ " ${SELECTED_ARRAY[*]} " =~ "apache" ]]; then
-    dialog --extra-button --extra-label "Назад" --ok-label "Далее" \
-      --inputbox "Путь для Apache:$INPUT_HINT" 12 70 "$APACHE_WWW_PATH" 2>"$TEMP_FILE"
-    [[ $? -eq 3 ]] && return 1
-    APACHE_WWW_PATH=$(cat "$TEMP_FILE")
-    [ -z "$APACHE_WWW_PATH" ] && APACHE_WWW_PATH="$SETUP_DIR/www"
-    APACHE_WWW_PATH=$(realpath -m "$APACHE_WWW_PATH")
-    mkdir -p "$APACHE_WWW_PATH" "$APACHE_WWW_PATH/conf"
-    [ ! -f "$APACHE_WWW_PATH/index.html" ] && echo "<h1>OK</h1>" > "$APACHE_WWW_PATH/index.html"
+    dialog --clear --title "📁 Путь Apache" --inputbox "Корень сайтов:" 10 70 "$APACHE_WWW_PATH" 2>"$TEMP_FILE"
+    [[ $? -eq 0 ]] && {
+      APACHE_WWW_PATH=$(cat "$TEMP_FILE")
+      [[ -z "$APACHE_WWW_PATH" ]] && APACHE_WWW_PATH="$SETUP_DIR/www"
+      APACHE_WWW_PATH=$(realpath -m "$APACHE_WWW_PATH")
+      mkdir -p "$APACHE_WWW_PATH" "$APACHE_WWW_PATH/conf"
+      [[ ! -f "$APACHE_WWW_PATH/index.html" ]] && echo "<h1>It works!</h1>" > "$APACHE_WWW_PATH/index.html"
+    }
   fi
-  return 0
-}
-
-input_parameters() {
-  local step=1
-  while true; do
-    case $step in
-      1) step_postgres && ((step++)) || return 1 ;;
-      2) step_jwt && ((step++)) || ((step--)) ;;
-      3) step_llm && ((step++)) || ((step--)) ;;
-      4) step_domain && ((step++)) || ((step--)) ;;
-      5) step_ports && ((step++)) || ((step--)) ;;
-      6) break ;;
+  
+  # LLM провайдер
+  if [[ " ${SELECTED_ARRAY[*]} " =~ "ollama" || " ${SELECTED_ARRAY[*]} " =~ "supabase" || " ${SELECTED_ARRAY[*]} " =~ "n8n" ]]; then
+    dialog --clear --title "🤖 LLM" --radiolist "Провайдер:" 15 60 4 \
+      "ollama" "Ollama (локально)" on "openai" "OpenAI" off "anthropic" "Anthropic" off \
+      2>"$TEMP_FILE"
+    [[ $? -ne 0 ]] && return 1
+    LLM_TYPE=$(cat "$TEMP_FILE")
+    case "$LLM_TYPE" in
+      openai|anthropic)
+        read_with_hint "🔑 API ключ ($LLM_TYPE):" "" "LLM_API_KEY" 1 || return 1
+        [[ "$LLM_TYPE" == "openai" ]] && LLM_API_URL="https://api.openai.com/v1"
+        [[ "$LLM_TYPE" == "anthropic" ]] && LLM_API_URL="https://api.anthropic.com/v1"
+        ;;
+      ollama) LLM_API_URL="http://ollama:11434" ;;
     esac
-  done
+  fi
+  
   save_params
+  return 0
 }
 
 # === 3. Сеть ===
 setup_network() {
-  docker network inspect internal_network &>/dev/null || docker network create internal_network >/dev/null
+  if ! docker network inspect internal_network &>/dev/null; then
+    docker network create internal_network >/dev/null
+    CREATED_NETWORKS+=("internal_network")
+  fi
   mkdir -p "$SETUP_DIR" && cd "$SETUP_DIR"
   cat > .env <<EOF
 POSTGRES_PASSWORD=${PGPASSWORD}
+POSTGRES_USER=${POSTGRES_USER}
 JWT_SECRET=${JWT_SECRET}
-LLM_TYPE=${LLM_TYPE}
-LLM_API_KEY=${LLM_API_KEY}
-LLM_API_URL=${LLM_API_URL}
-DOMAIN=${DOMAIN}
-SUPABASE_DOMAIN=${SUPABASE_DOMAIN}
-N8N_PORT=${N8N_PORT}
-N8N_DB_POSTGRES=${N8N_DB_POSTGRES}
-APACHE_WWW_PATH=${APACHE_WWW_PATH}
-APACHE_HTTP_PORT=${APACHE_HTTP_PORT}
-QDRANT_PORT=${QDRANT_PORT}
-OLLAMA_PORT=${OLLAMA_PORT}
 EOF
   chmod 600 .env
 }
 
-# === 4. Supabase (FIXED sed + networks) ===
+# === 4. Supabase ===
 setup_supabase() {
   [[ ! " ${SELECTED_ARRAY[*]} " =~ "supabase" ]] && return 0
   cd "$SETUP_DIR"
-  if [ ! -d "supabase-docker" ]; then
+  if [[ ! -d "supabase-docker" ]]; then
     git clone --depth 1 --filter=blob:none --sparse https://github.com/supabase/supabase >/dev/null 2>&1
     (cd supabase && git sparse-checkout set docker utils >/dev/null 2>&1)
     mv supabase/docker supabase-docker
@@ -304,65 +308,53 @@ setup_supabase() {
   fi
   cd supabase-docker
   cp .env.example .env
-  if [ -f "utils/generate-keys.sh" ]; then
+  
+  if [[ -f "utils/generate-keys.sh" ]]; then
     bash utils/generate-keys.sh > .env.keys 2>/dev/null
-    ANON_KEY=$(grep "^ANON_KEY=" .env.keys | cut -d= -f2- | tr -d '"')
-    SERVICE_ROLE_KEY=$(grep "^SERVICE_ROLE_KEY=" .env.keys | cut -d= -f2- | tr -d '"')
-    SECRET_KEY_BASE=$(grep "^SECRET_KEY_BASE=" .env.keys | cut -d= -f2- | tr -d '"')
-    VAULT_ENC_KEY=$(grep "^VAULT_ENC_KEY=" .env.keys | cut -d= -f2- | tr -d '"')
+    SUPABASE_ANON_KEY=$(grep "^ANON_KEY=" .env.keys | cut -d= -f2- | tr -d '"')
+    SUPABASE_SERVICE_KEY=$(grep "^SERVICE_ROLE_KEY=" .env.keys | cut -d= -f2- | tr -d '"')
     rm -f .env.keys
   else
-    ANON_KEY=$(openssl rand -hex 32); SERVICE_ROLE_KEY=$(openssl rand -hex 32)
-    SECRET_KEY_BASE=$(openssl rand -hex 32); VAULT_ENC_KEY=$(openssl rand -hex 32)
+    SUPABASE_ANON_KEY=$(openssl rand -hex 32)
+    SUPABASE_SERVICE_KEY=$(openssl rand -hex 32)
   fi
-  PG_META_CRYPTO_KEY=$(openssl rand -hex 32)
-  LOGFILE_PUBLIC_ACCESS_TOKEN=$(openssl rand -hex 32)
-  LOGFILE_PRIVATE_ACCESS_TOKEN=$(openssl rand -hex 32)
-  S3_PROTOCOL_ACCESS_KEY_ID=$(openssl rand -hex 16)
-  S3_PROTOCOL_ACCESS_KEY_SECRET=$(openssl rand -hex 32)
-  MINIO_ROOT_PASSWORD=$(openssl rand -hex 16)
-  DASHBOARD_PASSWORD=$(openssl rand -hex 12)
   
-  # ИСПРАВЛЕНО: | как разделитель sed + экранирование
-  sed -i "s|^ANON_KEY=.*|ANON_KEY=$ANON_KEY|" .env
-  sed -i "s|^SERVICE_ROLE_KEY=.*|SERVICE_ROLE_KEY=$SERVICE_ROLE_KEY|" .env
-  sed -i "s|^SECRET_KEY_BASE=.*|SECRET_KEY_BASE=$SECRET_KEY_BASE|" .env
-  sed -i "s|^VAULT_ENC_KEY=.*|VAULT_ENC_KEY=$VAULT_ENC_KEY|" .env
-  sed -i "s|^PG_META_CRYPTO_KEY=.*|PG_META_CRYPTO_KEY=$PG_META_CRYPTO_KEY|" .env
-  sed -i "s|^LOGFILE_PUBLIC_ACCESS_TOKEN=.*|LOGFILE_PUBLIC_ACCESS_TOKEN=$LOGFILE_PUBLIC_ACCESS_TOKEN|" .env
-  sed -i "s|^LOGFILE_PRIVATE_ACCESS_TOKEN=.*|LOGFILE_PRIVATE_ACCESS_TOKEN=$LOGFILE_PRIVATE_ACCESS_TOKEN|" .env
-  sed -i "s|^S3_PROTOCOL_ACCESS_KEY_ID=.*|S3_PROTOCOL_ACCESS_KEY_ID=$S3_PROTOCOL_ACCESS_KEY_ID|" .env
-  sed -i "s|^S3_PROTOCOL_ACCESS_KEY_SECRET=.*|S3_PROTOCOL_ACCESS_KEY_SECRET=$S3_PROTOCOL_ACCESS_KEY_SECRET|" .env
-  sed -i "s|^MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=$MINIO_ROOT_PASSWORD|" .env
-  sed -i "s|^DASHBOARD_PASSWORD=.*|DASHBOARD_PASSWORD=$DASHBOARD_PASSWORD|" .env
+  SUPABASE_DASHBOARD_PASS=$(openssl rand -hex 12)
+  
+  sed -i "s|^ANON_KEY=.*|ANON_KEY=$SUPABASE_ANON_KEY|" .env
+  sed -i "s|^SERVICE_ROLE_KEY=.*|SERVICE_ROLE_KEY=$SUPABASE_SERVICE_KEY|" .env
+  sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$JWT_SECRET|" .env
+  sed -i "s|^DASHBOARD_PASSWORD=.*|DASHBOARD_PASSWORD=$SUPABASE_DASHBOARD_PASS|" .env
   
   local esc_pass; esc_pass=$(printf '%s\n' "$PGPASSWORD" | sed 's/[&/|]/\\&/g')
   sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$esc_pass|" .env
-  sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$JWT_SECRET|" .env
-  if [ -n "$SUPABASE_DOMAIN" ]; then
+  
+  if [[ -n "$SUPABASE_DOMAIN" ]]; then
     sed -i "s|^PUBLIC_URL=.*|PUBLIC_URL=https://${SUPABASE_DOMAIN}|" .env
     sed -i "s|^API_EXTERNAL_URL=.*|API_EXTERNAL_URL=https://${SUPABASE_DOMAIN}|" .env
-    sed -i "s|^SITE_URL=.*|SITE_URL=https://${SUPABASE_DOMAIN}|" .env
   fi
-  # Убрано дублирование networks: - подключаем через docker network connect
   
   docker compose -p supabase up -d >/dev/null 2>&1
-  sleep 8
-  for c in $(docker ps --filter "name=supabase" --format "{{.Names}}" 2>/dev/null); do
+  
+  mapfile -t sb_containers < <(docker compose -p supabase ps --format "{{.Names}}" 2>/dev/null)
+  CREATED_CONTAINERS+=("${sb_containers[@]}")
+  
+  sleep 5
+  for c in "${sb_containers[@]}"; do
     docker network connect internal_network "$c" 2>/dev/null || true
   done
   cd ..
 }
 
-# === 5. docker-compose.yml (FIXED YAML + webhook) ===
+# === 5. docker-compose.yml ===
 generate_compose_file() {
   cd "$SETUP_DIR"
-  cat > docker-compose.yml <<'YAML_HEADER'
+  cat > docker-compose.yml <<'HEADER'
 networks:
   internal_network:
     external: true
 volumes:
-YAML_HEADER
+HEADER
   [[ " ${SELECTED_ARRAY[*]} " =~ "postgres" ]] && echo "  postgres_data:" >> docker-compose.yml
   [[ " ${SELECTED_ARRAY[*]} " =~ "qdrant" ]] && echo "  qdrant_storage:" >> docker-compose.yml
   [[ " ${SELECTED_ARRAY[*]} " =~ "ollama" ]] && echo "  ollama_data:" >> docker-compose.yml
@@ -370,92 +362,135 @@ YAML_HEADER
   [[ " ${SELECTED_ARRAY[*]} " =~ "portainer" ]] && echo "  portainer_data:" >> docker-compose.yml
   [[ " ${SELECTED_ARRAY[*]} " =~ "n8n" ]] && echo "  n8n_data:" >> docker-compose.yml
   echo "services:" >> docker-compose.yml
-
+  
   [[ " ${SELECTED_ARRAY[*]} " =~ "postgres" ]] && cat >> docker-compose.yml <<EOF
   postgres:
     image: postgres:16-alpine
     container_name: postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: admin
+      POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${PGPASSWORD}
       POSTGRES_DB: appdb
     volumes: [postgres_data:/var/lib/postgresql/data]
     networks: [internal_network]
 EOF
-
-  [[ " ${SELECTED_ARRAY[*]} " =~ "qdrant" ]] && cat >> docker-compose.yml <<EOF
+  
+  [[ " ${SELECTED_ARRAY[*]} " =~ "qdrant" ]] && {
+    local domain="${QDRANT_DOMAIN:-}"
+    cat >> docker-compose.yml <<EOF
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant
     restart: unless-stopped
-    ports: ["${QDRANT_PORT}:6333"]
+EOF
+    if [[ "$NPM_ENABLED" -eq 1 && -n "$domain" ]]; then
+      echo "    # Проксируется через NPM: $domain" >> docker-compose.yml
+    else
+      echo "    ports: [\"${QDRANT_PORT}:6333\"]" >> docker-compose.yml
+    fi
+    cat >> docker-compose.yml <<EOF
     volumes: [qdrant_storage:/qdrant/storage]
     networks: [internal_network]
 EOF
-
-  [[ " ${SELECTED_ARRAY[*]} " =~ "ollama" ]] && cat >> docker-compose.yml <<EOF
+  }
+  
+  [[ " ${SELECTED_ARRAY[*]} " =~ "ollama" ]] && {
+    local domain="${OLLAMA_DOMAIN:-}"
+    cat >> docker-compose.yml <<EOF
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
     restart: unless-stopped
-    ports: ["${OLLAMA_PORT}:11434"]
     environment: [OLLAMA_HOST=0.0.0.0]
+EOF
+    if [[ "$NPM_ENABLED" -eq 1 && -n "$domain" ]]; then
+      echo "    # Проксируется через NPM: $domain" >> docker-compose.yml
+    else
+      echo "    ports: [\"${OLLAMA_PORT}:11434\"]" >> docker-compose.yml
+    fi
+    cat >> docker-compose.yml <<EOF
     volumes: [ollama_data:/root/.ollama]
     networks: [internal_network]
 EOF
-
-  [[ " ${SELECTED_ARRAY[*]} " =~ "apache" ]] && cat >> docker-compose.yml <<EOF
+  }
+  
+  [[ " ${SELECTED_ARRAY[*]} " =~ "apache" ]] && {
+    local domain="${APACHE_DOMAIN:-}"
+    cat >> docker-compose.yml <<EOF
   apache:
     image: httpd:2.4-alpine
     container_name: apache
     restart: unless-stopped
-    ports: ["${APACHE_HTTP_PORT}:80"]
+EOF
+    if [[ "$NPM_ENABLED" -eq 1 && -n "$domain" ]]; then
+      echo "    # Проксируется через NPM: $domain" >> docker-compose.yml
+    else
+      echo "    ports: [\"${APACHE_PORT}:80\"]" >> docker-compose.yml
+    fi
+    cat >> docker-compose.yml <<EOF
     volumes:
       - "${APACHE_WWW_PATH}:/usr/local/apache2/htdocs/"
       - "${APACHE_WWW_PATH}/conf:/usr/local/apache2/conf/extra/"
     networks: [internal_network]
 EOF
-
+  }
+  
   [[ " ${SELECTED_ARRAY[*]} " =~ "nginx_proxy" ]] && cat >> docker-compose.yml <<EOF
   nginx-proxy-manager:
     image: jc21/nginx-proxy-manager:latest
     container_name: nginx-proxy-manager
     restart: unless-stopped
-    ports: ["80:80","443:443","81:81"]
-    volumes: [npm_data:/data,npm_letsencrypt:/etc/letsencrypt]
+    ports: ["80:80", "443:443", "81:81"]
+    volumes: [npm_data:/data, npm_letsencrypt:/etc/letsencrypt]
     networks: [internal_network]
 EOF
-
-  [[ " ${SELECTED_ARRAY[*]} " =~ "portainer" ]] && cat >> docker-compose.yml <<EOF
+  
+  [[ " ${SELECTED_ARRAY[*]} " =~ "portainer" ]] && {
+    local domain="${PORTAINER_DOMAIN:-}"
+    cat >> docker-compose.yml <<EOF
   portainer:
     image: portainer/portainer-ce:latest
     container_name: portainer
     restart: unless-stopped
     command: -H unix:///var/run/docker.sock
-    volumes: [/var/run/docker.sock:/var/run/docker.sock,portainer_data:/data]
-    ports: ["9000:9000"]
+EOF
+    if [[ "$NPM_ENABLED" -eq 1 && -n "$domain" ]]; then
+      echo "    # Проксируется через NPM: $domain" >> docker-compose.yml
+    else
+      echo "    ports: [\"9000:9000\"]" >> docker-compose.yml
+    fi
+    cat >> docker-compose.yml <<EOF
+    volumes: [/var/run/docker.sock:/var/run/docker.sock, portainer_data:/data]
     networks: [internal_network]
 EOF
-
+  }
+  
   if [[ " ${SELECTED_ARRAY[*]} " =~ "n8n" ]]; then
+    local domain="${N8N_DOMAIN:-}"
     cat >> docker-compose.yml <<EOF
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n
     restart: unless-stopped
-    ports: ["${N8N_PORT}:5678"]
-    environment:
-      N8N_HOST: ${DOMAIN:-localhost}
-      N8N_PORT: ${N8N_PORT}
-      WEBHOOK_URL: ${DOMAIN:+https://}${DOMAIN:-http://localhost}:${N8N_PORT}
 EOF
-    if [ "${N8N_DB_POSTGRES:-0}" -eq 1 ]; then
+    if [[ "$NPM_ENABLED" -eq 1 && -n "$domain" ]]; then
+      echo "    # Проксируется через NPM: $domain" >> docker-compose.yml
+    else
+      echo "    ports: [\"${N8N_PORT}:5678\"]" >> docker-compose.yml
+    fi
+    cat >> docker-compose.yml <<EOF
+    environment:
+      N8N_HOST: ${domain:-localhost}
+      N8N_PORT: 5678
+      WEBHOOK_URL: ${domain:+https://}${domain:-http://localhost}${domain:+:443}${domain:-:${N8N_PORT}}
+EOF
+    if [[ "${N8N_DB_POSTGRES:-0}" -eq 1 ]]; then
       cat >> docker-compose.yml <<EOF
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
-      DB_POSTGRESDB_USER: admin
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
       DB_POSTGRESDB_PASSWORD: ${PGPASSWORD}
       DB_POSTGRESDB_DATABASE: n8n
 EOF
@@ -471,95 +506,299 @@ EOF
 start_containers() {
   cd "$SETUP_DIR"
   docker compose up -d >/dev/null 2>&1
+  # Сохраняем список созданных контейнеров
+  mapfile -t main_containers < <(docker compose ps --format "{{.Names}}" 2>/dev/null)
+  CREATED_CONTAINERS+=("${main_containers[@]}")
+  
   if [[ " ${SELECTED_ARRAY[*]} " =~ "n8n" && "${N8N_DB_POSTGRES:-0}" -eq 1 ]]; then
     for i in {1..30}; do
-      docker exec postgres pg_isready -U admin &>/dev/null && break
+      docker exec postgres pg_isready -U "$POSTGRES_USER" &>/dev/null && break
       sleep 2
     done
-    docker exec postgres psql -U admin -c "CREATE DATABASE n8n;" 2>/dev/null || true
+    docker exec postgres psql -U "$POSTGRES_USER" -c "CREATE DATABASE n8n;" 2>/dev/null || true
   fi
 }
 
-# === 7. SSL для NPM (автоматически) ===
+# === 7. SSL ===
 configure_npm_ssl() {
-  [[ ! " ${SELECTED_ARRAY[*]} " =~ "nginx_proxy" || -z "$DOMAIN" ]] && return 0
-  echo "### Ожидание NPM..." >&2
+  [[ "$NPM_ENABLED" -ne 1 || -z "$DOMAIN_MAIN" ]] && return 0
+  echo "### Настройка SSL..." >&2
   sleep 12
   command -v jq &>/dev/null || { apt-get update -qq >/dev/null && apt-get install -y jq >/dev/null 2>&1; }
+  
   local NPM_API="http://localhost:81/api"
   local TOKEN
   TOKEN=$(curl -s -X POST "$NPM_API/tokens" -H "Content-Type: application/json" \
-    -d '{"identity":"admin@example.com","secret":"changeme"}' 2>/dev/null | jq -r '.token' 2>/dev/null)
+    -d "{\"identity\":\"$NPM_ADMIN_EMAIL\",\"secret\":\"$NPM_ADMIN_PASS\"}" 2>/dev/null | jq -r '.token' 2>/dev/null)
+  
   if [[ "$TOKEN" == "null" || -z "$TOKEN" ]]; then
-    echo -e "${YELLOW}⚠ NPM API: авторизация не удалась. Настройте SSL вручную.${NC}" >&2
+    echo -e "${YELLOW}⚠ NPM API: настройте SSL вручную в панели :81${NC}" >&2
     return 1
   fi
-  local fwd_host="apache" fwd_port=80
-  [[ " ${SELECTED_ARRAY[*]} " =~ "n8n" ]] && { fwd_host="n8n"; fwd_port=5678; }
-  echo "### Создание прокси + SSL для $DOMAIN..." >&2
-  local res
-  res=$(curl -s -X POST "$NPM_API/nginx/proxy-hosts" \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d "{\"domain_names\":[\"$DOMAIN\"],\"forward_host\":\"$fwd_host\",\"forward_port\":$fwd_port,\"certificate_id\":\"new\",\"meta\":{\"letsencrypt_agree\":true,\"dns_challenge\":false},\"ssl_forced\":true,\"hsts_enabled\":true,\"http2_support\":true}" 2>/dev/null)
-  if echo "$res" | jq -e '.id > 0' &>/dev/null; then
-    echo -e "${GREEN}✅ SSL настроен для $DOMAIN${NC}" >&2
-  else
-    echo -e "${YELLOW}⚠ Ошибка NPM: $(echo "$res" | jq -r '.error.message // "Unknown"')${NC}" >&2
-  fi
+  
+  for svc in n8n apache qdrant ollama portainer supabase; do
+    local domain_var="${svc^^}_DOMAIN"
+    local domain="${!domain_var:-}"
+    [[ -z "$domain" ]] && continue
+    local fwd_host="$svc" fwd_port=80
+    case "$svc" in
+      n8n) fwd_port=5678 ;; qdrant) fwd_port=6333 ;; ollama) fwd_port=11434 ;;
+      apache) fwd_port=80 ;; portainer) fwd_port=9000 ;;
+      supabase) fwd_host="supabase-kong"; fwd_port=8000 ;;
+    esac
+    curl -s -X POST "$NPM_API/nginx/proxy-hosts" \
+      -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+      -d "{\"domain_names\":[\"$domain\"],\"forward_host\":\"$fwd_host\",\"forward_port\":$fwd_port,\"certificate_id\":\"new\",\"meta\":{\"letsencrypt_agree\":true,\"dns_challenge\":false},\"ssl_forced\":true,\"hsts_enabled\":true,\"http2_support\":true}" >/dev/null 2>&1
+  done
+  echo -e "${GREEN}✅ SSL настроен${NC}" >&2
 }
 
-# === 8. Полное удаление (WIPE) ===
+# === 8. Полное удаление ===
 full_cleanup() {
-  dialog --yesno "⚠️ УДАЛИТЬ ВСЁ: контейнеры, тома, конфиги?\nДанные будут потеряны!" 10 60 || return 0
+  dialog --yesno "⚠️ УДАЛИТЬ ВСЁ?\nКонтейнеры, тома, сети, конфиги.\nДанные будут потеряны!" 12 60 || return 0
   echo -e "${YELLOW}🧹 Остановка...${NC}" >&2
   docker compose -p supabase down -v 2>/dev/null || true
   cd "$SETUP_DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true
-  echo -e "${YELLOW}🧹 Очистка системы...${NC}" >&2
+  for c in "${CREATED_CONTAINERS[@]}"; do docker rm -f "$c" 2>/dev/null || true; done
+  for v in "${CREATED_VOLUMES[@]}"; do docker volume rm "$v" 2>/dev/null || true; done
+  for n in "${CREATED_NETWORKS[@]}"; do docker network rm "$n" 2>/dev/null || true; done
   docker system prune -af --volumes 2>/dev/null || true
   rm -rf "$SETUP_DIR" "$STATE_DIR"
   dialog --msgbox "✅ Сервер очищен." 8 40
   exit 0
 }
 
-# === 9. Переустановка ===
 reinstall_service() {
   local svc=$1; cd "$SETUP_DIR" 2>/dev/null || return 1
-  case $svc in
-    supabase) docker compose -p supabase down -v; rm -rf supabase-docker; setup_supabase ;;
-    *) docker compose stop "$svc" 2>/dev/null; docker compose rm -f "$svc" 2>/dev/null; generate_compose_file; docker compose up -d "$svc" ;;
+  case "$svc" in
+    supabase) docker compose -p supabase down -v 2>/dev/null; rm -rf supabase-docker; setup_supabase ;;
+    *) docker compose stop "$svc" 2>/dev/null; docker compose rm -f "$svc" 2>/dev/null; generate_compose_file; docker compose up -d "$svc" 2>/dev/null ;;
   esac
-  dialog --msgbox "$svc переустановлен." 6 40
+  dialog --msgbox "✅ $svc переустановлен." 6 40
 }
 
-# === 10. Финал ===
+# === 🎯 9. ДЕТАЛИЗИРОВАННАЯ СВОДКА ===
 show_summary() {
-  local ip; ip=$(hostname -I | awk '{print $1}')
-  local txt="✅ Готово!\nIP: $ip"
-  [[ -n "$DOMAIN" ]] && txt+="\nДомен: $DOMAIN"
-  txt+="\n\nPostgres: $PGPASSWORD\nJWT: $JWT_SECRET"
-  echo -e "$txt" > "$STATE_DIR/summary.txt"
-  dialog --title "Готово (копировать мышкой)" --textbox "$STATE_DIR/summary.txt" 15 60
+  local ip=$(hostname -I | awk '{print $1}')
+  local external_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "не определён")
+  
+  local summary_file="$STATE_DIR/summary.txt"
+  
+  {
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║           ✅ УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА                   ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📍 СЕТЬ И ДОСТУП"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Локальный IP:  $ip"
+    echo "  Внешний IP:    $external_ip"
+    [[ -n "$DOMAIN_MAIN" ]] && echo "  Домен:         $DOMAIN_MAIN"
+    echo ""
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📦 УСТАНОВЛЕННЫЕ СЕРВИСЫ"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # PostgreSQL
+    if [[ " ${SELECTED_ARRAY[*]} " =~ "postgres" ]]; then
+      echo ""
+      echo "🐘 PostgreSQL"
+      echo "  ├─ Контейнер:  postgres"
+      echo "  ├─ Пользователь: ${POSTGRES_USER}"
+      echo "  ├─ Пароль:     ${PGPASSWORD}"
+      echo "  ├─ БД:         appdb"
+      [[ "${N8N_DB_POSTGRES:-0}" -eq 1 ]] && echo "  ├─ БД n8n:     n8n"
+      echo "  ├─ Порт:       5432 (только внутри сети)"
+      echo "  └─ Volume:     postgres_data:/var/lib/postgresql/data"
+    fi
+    
+    # n8n
+    if [[ " ${SELECTED_ARRAY[*]} " =~ "n8n" ]]; then
+      echo ""
+      echo "🤖 n8n (автоматизация)"
+      echo "  ├─ Контейнер:  n8n"
+      if [[ -n "${N8N_DOMAIN:-}" ]]; then
+        echo "  ├─ URL:        https://${N8N_DOMAIN}"
+      else
+        echo "  ├─ URL:        http://$ip:${N8N_PORT}"
+      fi
+      echo "  ├─ Порт:       ${N8N_PORT}"
+      echo "  ├─ БД:         $([ "${N8N_DB_POSTGRES:-0}" -eq 1 ] && echo "PostgreSQL (n8n)" || echo "SQLite (встроенная)")"
+      echo "  └─ Volume:     n8n_data:/home/node/.n8n"
+    fi
+    
+    # Portainer
+    if [[ " ${SELECTED_ARRAY[*]} " =~ "portainer" ]]; then
+      echo ""
+      echo "🎛  Portainer (Docker UI)"
+      echo "  ├─ Контейнер:  portainer"
+      if [[ -n "${PORTAINER_DOMAIN:-}" ]]; then
+        echo "  ├─ URL:        https://${PORTAINER_DOMAIN}"
+      else
+        echo "  ├─ URL:        http://$ip:9000"
+      fi
+      echo "  ├─ Порт:       9000"
+      echo "  └─ Volume:     portainer_data:/data"
+    fi
+    
+    # Nginx Proxy Manager
+    if [[ " ${SELECTED_ARRAY[*]} " =~ "nginx_proxy" ]]; then
+      echo ""
+      echo "🔐 Nginx Proxy Manager"
+      echo "  ├─ Контейнер:  nginx-proxy-manager"
+      echo "  ├─ Admin UI:   http://$ip:81"
+      echo "  ├─ Логин:      $NPM_ADMIN_EMAIL"
+      echo "  ├─ Пароль:     $NPM_ADMIN_PASS"
+      echo "  │              ⚠ СМЕНИТЕ ПРИ ПЕРВОМ ВХОДЕ!"
+      echo "  ├─ Порты:      80 (HTTP), 443 (HTTPS), 81 (Admin)"
+      echo "  └─ Volumes:    npm_data:/data, npm_letsencrypt:/etc/letsencrypt"
+    fi
+    
+    # Supabase
+    if [[ " ${SELECTED_ARRAY[*]} " =~ "supabase" ]]; then
+      echo ""
+      echo "⚡ Supabase (BaaS)"
+      echo "  ├─ Проект:     supabase (отдельный compose)"
+      if [[ -n "${SUPABASE_DOMAIN:-}" ]]; then
+        echo "  ├─ URL:        https://${SUPABASE_DOMAIN}"
+      else
+        echo "  ├─ URL:        http://$ip:8000 (Kong API)"
+      fi
+      echo "  ├─ Studio:     http://$ip:3000 (если опубликован)"
+      echo "  ├─ Dashboard пароль: ${SUPABASE_DASHBOARD_PASS}"
+      echo "  ├─ JWT Secret: $JWT_SECRET"
+      echo "  ├─ ANON_KEY:   ${SUPABASE_ANON_KEY:0:32}..."
+      echo "  ├─ SERVICE_KEY: ${SUPABASE_SERVICE_KEY:0:32}..."
+      echo "  └─ Каталог:    $SETUP_DIR/supabase-docker"
+    fi
+    
+    # Qdrant
+    if [[ " ${SELECTED_ARRAY[*]} " =~ "qdrant" ]]; then
+      echo ""
+      echo "🔷 Qdrant (векторная БД)"
+      echo "  ├─ Контейнер:  qdrant"
+      if [[ -n "${QDRANT_DOMAIN:-}" ]]; then
+        echo "  ├─ URL:        https://${QDRANT_DOMAIN}"
+      else
+        echo "  ├─ URL:        http://$ip:${QDRANT_PORT}"
+      fi
+      echo "  ├─ Порт:       ${QDRANT_PORT}"
+      echo "  └─ Volume:     qdrant_storage:/qdrant/storage"
+    fi
+    
+    # Ollama
+    if [[ " ${SELECTED_ARRAY[*]} " =~ "ollama" ]]; then
+      echo ""
+      echo "🧠 Ollama (локальные LLM)"
+      echo "  ├─ Контейнер:  ollama"
+      if [[ -n "${OLLAMA_DOMAIN:-}" ]]; then
+        echo "  ├─ URL:        https://${OLLAMA_DOMAIN}"
+      else
+        echo "  ├─ URL:        http://$ip:${OLLAMA_PORT}"
+      fi
+      echo "  ├─ Порт:       ${OLLAMA_PORT}"
+      echo "  ├─ Volume:     ollama_data:/root/.ollama"
+      echo "  └─ Команды:"
+      echo "      docker exec -it ollama ollama pull llama3.1"
+      echo "      docker exec -it ollama ollama pull nomic-embed-text"
+    fi
+    
+    # Apache
+    if [[ " ${SELECTED_ARRAY[*]} " =~ "apache" ]]; then
+      echo ""
+      echo "🌐 Apache (веб-сервер)"
+      echo "  ├─ Контейнер:  apache"
+      if [[ -n "${APACHE_DOMAIN:-}" ]]; then
+        echo "  ├─ URL:        https://${APACHE_DOMAIN}"
+      else
+        echo "  ├─ URL:        http://$ip:${APACHE_PORT}"
+      fi
+      echo "  ├─ Порт:       ${APACHE_PORT}"
+      echo "  ├─ Корень:     ${APACHE_WWW_PATH}"
+      echo "  └─ Конфиг:     ${APACHE_WWW_PATH}/conf"
+    fi
+    
+    # LLM
+    if [[ -n "${LLM_TYPE:-}" && "$LLM_TYPE" != "ollama" ]]; then
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "🤖 LLM ПРОВАЙДЕР"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "  Провайдер:     ${LLM_TYPE^^}"
+      echo "  API URL:       ${LLM_API_URL}"
+      echo "  API Key:       ${LLM_API_KEY:0:10}...${LLM_API_KEY: -4}"
+    fi
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📁 ФАЙЛОВАЯ СТРУКТУРА"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Каталог установки:  $SETUP_DIR"
+    echo "  ├─ docker-compose.yml  (основные сервисы)"
+    echo "  ├─ .env                (переменные окружения)"
+    [[ " ${SELECTED_ARRAY[*]} " =~ "supabase" ]] && echo "  ├─ supabase-docker/    (отдельный проект Supabase)"
+    [[ " ${SELECTED_ARRAY[*]} " =~ "apache" ]] && echo "  └─ ${APACHE_WWW_PATH}  (сайты Apache)"
+    echo ""
+    echo "  Конфигурация:         $STATE_DIR"
+    echo "  ├─ params.env          (пароли, параметры)"
+    echo "  ├─ selected_services.cfg"
+    echo "  └─ summary.txt         (этот файл)"
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🛠 ПОЛЕЗНЫЕ КОМАНДЫ"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Просмотр логов:       docker compose -f $SETUP_DIR/docker-compose.yml logs -f"
+    echo "  Логи Supabase:        docker compose -p supabase logs -f"
+    echo "  Перезапуск:           cd $SETUP_DIR && docker compose restart"
+    echo "  Остановка всего:      cd $SETUP_DIR && docker compose down"
+    echo "  Добавить в автозагрузку: systemctl enable docker"
+    echo ""
+    echo "  Повторный запуск установщика:"
+    echo "    sudo bash $SETUP_DIR/../install.sh  (или скачать заново)"
+    echo ""
+    echo "  Полное удаление (WIPE):"
+    echo "    sudo bash install.sh → выбрать пункт '3' в меню"
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "⚠️  ВАЖНЫЕ ЗАМЕЧАНИЯ"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    [[ " ${SELECTED_ARRAY[*]} " =~ "nginx_proxy" ]] && echo "  • Смените пароль NPM при первом входе (admin@example.com)"
+    [[ " ${SELECTED_ARRAY[*]} " =~ "ollama" ]] && echo "  • Загрузите модели Ollama: docker exec -it ollama ollama pull llama3.1"
+    [[ " ${SELECTED_ARRAY[*]} " =~ "supabase" ]] && echo "  • Supabase использует свой docker-compose (проект 'supabase')"
+    [[ "$NPM_ENABLED" -eq 1 && -n "$DOMAIN_MAIN" ]] && echo "  • Убедитесь, что DNS A-записи указывают на $external_ip"
+    echo "  • Сохраните этот файл: cat $summary_file"
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║          🎉 УДАЧНОЙ РАБОТЫ С ВАШИМИ СЕРВИСАМИ!              ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+  } | tee "$summary_file"
+  
+  # Показываем в dialog тоже
+  dialog --title "📋 Итоговая сводка" --textbox "$summary_file" 30 80
 }
 
 run_installation_process() {
   {
     echo "5"; echo "### Docker..." >&2; install_docker
     echo "15"; echo "### Сеть..." >&2; setup_network
-    echo "30"; echo "### Supabase..." >&2; setup_supabase
+    echo "30"; [[ " ${SELECTED_ARRAY[*]} " =~ "supabase" ]] && { echo "### Supabase..." >&2; setup_supabase; }
     echo "60"; echo "### Конфиг..." >&2; generate_compose_file
     echo "80"; echo "### Запуск..." >&2; start_containers
-    echo "95"; echo "### SSL..." >&2; configure_npm_ssl
-    echo "100"; echo "### Завершено!" >&2; sleep 1
-  } | dialog --title "Установка" --gauge "Настройка..." 10 60 0
+    echo "95"; [[ "$NPM_ENABLED" -eq 1 ]] && { echo "### SSL..." >&2; configure_npm_ssl; }
+    echo "100"; echo "### Готово!" >&2; sleep 1
+  } | dialog --title "🚀 Установка" --gauge "Настройка сервисов..." 10 60 0
 }
 
-# === ГЛАВНАЯ ===
 main() {
-  grep -qi "ubuntu\|debian" /etc/os-release || { echo "Только Ubuntu/Debian"; exit 1; }
-  [ "$EUID" -eq 0 ] || { echo "Запустите с sudo"; exit 1; }
+  grep -qi "ubuntu\|debian" /etc/os-release || { echo "❌ Только Ubuntu/Debian"; exit 1; }
+  [ "$EUID" -eq 0 ] || { echo "❌ Запустите с sudo"; exit 1; }
   command -v dialog &>/dev/null || { apt-get update -qq >/dev/null; apt-get install -y dialog jq >/dev/null 2>&1; }
   
-  load_selected_services; load_params
+  load_selected; load_params
   [[ "$1" == "--reinstall" && -n "$2" ]] && { reinstall_service "$2"; exit 0; }
   
   case "$(get_state)" in
@@ -567,13 +806,17 @@ main() {
       show_service_menu || { save_state "start"; main; return; }
       input_parameters || { show_service_menu || { save_state "start"; main; return; }; }
       run_installation_process
-      save_state "completed"; show_summary ;;
+      save_state "completed"
+      show_summary
+      ;;
     completed)
-      dialog --menu "Действие:" 14 60 4 \
-        "1" "Добавить/удалить сервисы" \
-        "2" "Переустановить сервис" \
+      dialog --menu "✅ Установка завершена. Действие:" 18 60 6 \
+        "1" "➕ Добавить/удалить сервисы" \
+        "2" "🔄 Переустановить сервис" \
         "3" "🗑 Полное удаление (WIPE)" \
-        "4" "Выйти" 2>"$TEMP_FILE"
+        "4" "📋 Показать сводку снова" \
+        "5" "💾 Сохранить сводку в /root" \
+        "6" "🚪 Выйти" 2>"$TEMP_FILE"
       case "$(cat "$TEMP_FILE")" in
         1) show_service_menu; input_parameters; run_installation_process; show_summary ;;
         2)
@@ -581,12 +824,16 @@ main() {
           for s in postgres qdrant ollama apache nginx-proxy-manager portainer supabase n8n; do
             docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^$s$" && installed+=("$s" "$s" off)
           done
-          [ ${#installed[@]} -eq 0 ] && { dialog --msgbox "Нет сервисов." 6 40; exit 0; }
-          dialog --checklist "Выберите:" 15 50 6 "${installed[@]}" 2>"$TEMP_FILE"
-          for s in $(cat "$TEMP_FILE" | tr -d '"'); do reinstall_service "$s"; done ;;
+          [ ${#installed[@]} -eq 0 ] && { dialog --msgbox "Нет активных сервисов." 6 40; exit 0; }
+          dialog --checklist "Выберите для переустановки:" 15 50 6 "${installed[@]}" 2>"$TEMP_FILE"
+          for s in $(cat "$TEMP_FILE" | tr -d '"'); do reinstall_service "$s"; done
+          ;;
         3) full_cleanup ;;
+        4) show_summary ;;
+        5) cp "$STATE_DIR/summary.txt" /root/install-summary.txt && dialog --msgbox "✅ Сохранено в /root/install-summary.txt" 6 50 ;;
         *) exit 0 ;;
-      esac ;;
+      esac
+      ;;
     *) rm -rf "$STATE_DIR"; save_state "start"; main ;;
   esac
 }
