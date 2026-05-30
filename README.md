@@ -3,9 +3,9 @@ curl -fsSL https://raw.githubusercontent.com/Pavel-work/installer_docker/main/in
 ```
 отладка 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Pavel-work/installer_docker/main/otladka.sh -o otladka.sh && sudo bash otladka.sh
+curl 
 ```
 
 ```bash
-sudo tail -f /tmp/installer-debug.log
+sudo 
 ```
