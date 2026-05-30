@@ -1,10 +1,8 @@
 #!/bin/bash
 
 # ==========================================
-# Docker Installer с реальным бэкендом
+# Docker Installer - ИСПРАВЛЕННАЯ ВЕРСИЯ
 # ==========================================
-
-set -e  # Остановка при ошибке
 
 # Проверка root прав
 if [ "$EUID" -ne 0 ]; then 
@@ -18,30 +16,46 @@ if ! command -v dialog &> /dev/null; then
     apt-get update && apt-get install -y dialog
 fi
 
-# Цвета для вывода
+# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+BLUE='\033[0;34m'
+NC='\033[0m'
 
 # Пути
 INSTALL_DIR="/opt/docker"
 COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
-ENV_FILE="$INSTALL_DIR/.env"
 CREDENTIALS_FILE="$INSTALL_DIR/credentials.txt"
+LOG_FILE="$INSTALL_DIR/install.log"
 
 # Создание директории
 mkdir -p "$INSTALL_DIR"
+> "$LOG_FILE"
+
+# Функция логирования
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# Проверка порта
+check_port() {
+    local port=$1
+    if ss -tlnp | grep -q ":${port} "; then
+        return 1  # Порт занят
+    fi
+    return 0  # Порт свободен
+}
 
 clear
 
 # ==========================================
 # 1. Приветствие
 # ==========================================
-dialog --backtitle "Docker Installer" \
+dialog --backtitle "Docker Installer v2.0" \
        --title "Добро пожаловать" \
        --yes-label "Начать" --no-label "Выход" \
-       --yesno "Добро пожаловать в установщик Docker!\n\nБудут установлены Docker Engine и выбранные сервисы." 10 70
+       --yesno "Добро пожаловать в установщик Docker!\n\nБудут установлены Docker Engine и выбранные сервисы.\n\nТребуется: sudo, интернет, свободные порты." 12 70
 
 [ $? -ne 0 ] && { clear; exit 0; }
 
@@ -59,7 +73,6 @@ choices=$(dialog --stdout \
                  "Apache" "Веб-сервер Apache" OFF \
                  "NginxProxy" "Nginx Proxy Manager" OFF \
                  "Portainer" "Управление Docker" OFF \
-                 "Supabase" "Supabase Full Stack" OFF \
                  "n8n" "Автоматизация n8n" OFF)
 
 [ $? -ne 0 ] && { dialog --msgbox "Отменено" 6 50; clear; exit 0; }
@@ -69,7 +82,39 @@ clean_choices=$(echo "$choices" | xargs -n 1 | tr -d '"')
 num_selected=$(echo "$clean_choices" | wc -l)
 
 # ==========================================
-# 3. Подтверждение
+# 3. Проверка портов
+# ==========================================
+port_conflicts=""
+declare -A service_ports=(
+    ["PostgreSQL"]="5432"
+    ["Qdrant"]="6333,6334"
+    ["Ollama"]="11434"
+    ["Apache"]="80,443"
+    ["NginxProxy"]="80,81,443"
+    ["Portainer"]="9000,9443"
+    ["n8n"]="5678"
+)
+
+for service in $clean_choices; do
+    if [ -n "${service_ports[$service]}" ]; then
+        IFS=',' read -ra ports <<< "${service_ports[$service]}"
+        for port in "${ports[@]}"; do
+            if ! check_port $port; then
+                port_conflicts="${port_conflicts}\n  • $service - порт $port ЗАНЯТ"
+            fi
+        done
+    fi
+done
+
+if [ -n "$port_conflicts" ]; then
+    dialog --title "⚠️ КОНФЛИКТ ПОРТОВ" \
+           --msgbox "Следующие порты уже используются:\n${port_conflicts}\n\nОсвободите порты или выберите другие сервисы." 15 70
+    clear
+    exit 1
+fi
+
+# ==========================================
+# 4. Подтверждение
 # ==========================================
 services_list=$(echo "$clean_choices" | sed 's/^/    • /')
 
@@ -83,45 +128,65 @@ dialog --title "Подтверждение" \
 # ФУНКЦИИ УСТАНОВКИ
 # ==========================================
 
+# Определение команды Docker Compose
+detect_compose() {
+    if command -v docker-compose &> /dev/null; then
+        echo "docker-compose"
+    elif docker compose version &> /dev/null; then
+        echo "docker compose"
+    else
+        echo ""
+    fi
+}
+
+COMPOSE_CMD=$(detect_compose)
+
 # Установка Docker
 install_docker() {
-    dialog --infobox "\n📦 Установка Docker Engine...\n" 6 60
+    log "Проверка Docker..."
     
     if ! command -v docker &> /dev/null; then
-        # Установка Docker
-        curl -fsSL https://get.docker.com -o get-docker.sh
-        sh get-docker.sh
-        rm get-docker.sh
+        log "Установка Docker Engine..."
+        dialog --infobox "\n📦 Установка Docker Engine...\n" 6 60
         
-        # Добавление в группу docker
-        usermod -aG docker $SUDO_USER 2>/dev/null || true
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh 2>> "$LOG_FILE"
+        sh /tmp/get-docker.sh 2>> "$LOG_FILE"
+        rm -f /tmp/get-docker.sh
         
-        # Запуск служб
-        systemctl enable docker
-        systemctl start docker
+        systemctl enable docker 2>> "$LOG_FILE"
+        systemctl start docker 2>> "$LOG_FILE"
+        
+        log "✓ Docker Engine установлен"
+    else
+        log "Docker уже установлен"
     fi
     
-    # Установка Docker Compose
-    if ! command -v docker-compose &> /dev/null; then
-        curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
-            -o /usr/local/bin/docker-compose
+    # Установка Docker Compose если нужно
+    if [ -z "$COMPOSE_CMD" ]; then
+        log "Установка Docker Compose..."
+        dialog --infobox "\n📦 Установка Docker Compose...\n" 6 60
+        
+        DOCKER_COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")')
+        curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" \
+            -o /usr/local/bin/docker-compose 2>> "$LOG_FILE"
         chmod +x /usr/local/bin/docker-compose
+        
+        COMPOSE_CMD="docker-compose"
+        log "✓ Docker Compose установлен"
     fi
     
-    echo -e "${GREEN}✓ Docker установлен${NC}"
+    echo -e "${GREEN}✓ Docker готов${NC}"
+    sleep 1
 }
 
 # Генерация docker-compose.yml
 generate_compose() {
     cat > "$COMPOSE_FILE" << 'EOF'
 version: '3.8'
+
 services:
 EOF
-}
-
-# Добавление сервиса в compose
-add_service() {
-    echo -e "$1" >> "$COMPOSE_FILE"
+    log "Создан docker-compose.yml"
 }
 
 # Установка PostgreSQL
@@ -143,7 +208,7 @@ install_postgresql() {
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
-      - docker_network
+      - app_network
 
 EOF
     
@@ -152,6 +217,8 @@ EOF
   Пользователь: postgres
   Пароль: $POSTGRES_PASSWORD
   URL: localhost:5432" >> "$CREDENTIALS_FILE"
+    
+    log "✓ PostgreSQL добавлен в compose"
 }
 
 # Установка Qdrant
@@ -168,7 +235,7 @@ install_qdrant() {
     volumes:
       - qdrant_data:/qdrant/storage
     networks:
-      - docker_network
+      - app_network
 
 EOF
     
@@ -176,6 +243,8 @@ EOF
   REST API: http://localhost:6333
   gRPC: localhost:6334
   Dashboard: http://localhost:6333/dashboard" >> "$CREDENTIALS_FILE"
+    
+    log "✓ Qdrant добавлен в compose"
 }
 
 # Установка Ollama
@@ -191,7 +260,7 @@ install_ollama() {
     volumes:
       - ollama_data:/root/.ollama
     networks:
-      - docker_network
+      - app_network
 
 EOF
     
@@ -199,11 +268,14 @@ EOF
   Порт: 11434
   API: http://localhost:11434
   Команда: ollama pull llama2" >> "$CREDENTIALS_FILE"
+    
+    log "✓ Ollama добавлен в compose"
 }
 
 # Установка Apache
 install_apache() {
     mkdir -p "$INSTALL_DIR/apache/html"
+    echo "<h1>Apache работает!</h1>" > "$INSTALL_DIR/apache/html/index.html"
     
     cat >> "$COMPOSE_FILE" << 'EOF'
 
@@ -217,7 +289,7 @@ install_apache() {
     volumes:
       - ./apache/html:/usr/local/apache2/htdocs
     networks:
-      - docker_network
+      - app_network
 
 EOF
     
@@ -225,6 +297,8 @@ EOF
   HTTP: http://localhost:80
   HTTPS: https://localhost:443
   Директория: $INSTALL_DIR/apache/html" >> "$CREDENTIALS_FILE"
+    
+    log "✓ Apache добавлен в compose"
 }
 
 # Установка Nginx Proxy Manager
@@ -244,16 +318,16 @@ install_nginxproxy() {
       - '81:81'
       - '443:443'
     environment:
-      DB_MYSQL_HOST: db
+      DB_MYSQL_HOST: npm-db
       DB_MYSQL_PORT: 3306
       DB_MYSQL_USER: npm
-      DB_MYSQL_PASSWORD: ${NGINX_PASSWORD}
+      DB_MYSQL_PASSWORD: '${NGINX_PASSWORD}'
       DB_MYSQL_NAME: npm
     volumes:
       - ./nginx-proxy/data:/data
       - ./nginx-proxy/letsencrypt:/etc/letsencrypt
     networks:
-      - docker_network
+      - app_network
     depends_on:
       - npm-db
 
@@ -262,14 +336,14 @@ install_nginxproxy() {
     container_name: npm-db
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${NGINX_PASSWORD}
+      MYSQL_ROOT_PASSWORD: '${NGINX_PASSWORD}'
       MYSQL_DATABASE: npm
       MYSQL_USER: npm
-      MYSQL_PASSWORD: ${NGINX_PASSWORD}
+      MYSQL_PASSWORD: '${NGINX_PASSWORD}'
     volumes:
       - npm_mysql_data:/var/lib/mysql
     networks:
-      - docker_network
+      - app_network
 
 EOF
     
@@ -277,6 +351,8 @@ EOF
   Панель: http://localhost:81
   Email: admin@example.com
   Пароль: changeme (измените при первом входе)" >> "$CREDENTIALS_FILE"
+    
+    log "✓ Nginx Proxy Manager добавлен в compose"
 }
 
 # Установка Portainer
@@ -294,7 +370,7 @@ install_portainer() {
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
     networks:
-      - docker_network
+      - app_network
 
 EOF
     
@@ -302,103 +378,15 @@ EOF
   HTTP: http://localhost:9000
   HTTPS: https://localhost:9443
   Создайте admin при первом входе" >> "$CREDENTIALS_FILE"
-}
-
-# Установка Supabase
-install_supabase() {
-    SUPABASE_PASSWORD=$(openssl rand -base64 16)
     
-    dialog --infobox "\n📦 Supabase требует больше ресурсов...\n  Минимум: 2GB RAM, 2 CPU\n" 8 60
-    sleep 2
-    
-    cat >> "$COMPOSE_FILE" << EOF
-
-  supabase-kong:
-    image: kong:2.8.1
-    container_name: supabase-kong
-    restart: unless-stopped
-    environment:
-      KONG_DATABASE: "off"
-      KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
-      KONG_DNS_ORDER: LAST,A,CNAME
-      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
-      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
-      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
-    ports:
-      - "8000:8000"
-    networks:
-      - docker_network
-
-  supabase-studio:
-    image: supabase/studio:latest
-    container_name: supabase-studio
-    restart: unless-stopped
-    environment:
-      STUDIO_PG_META_URL: http://supabase-meta:8080
-      POSTGRES_PASSWORD: ${SUPABASE_PASSWORD}
-      DEFAULT_ORGANIZATION_NAME: Default Org
-      DEFAULT_PROJECT_NAME: Default Project
-    ports:
-      - "8001:3000"
-    networks:
-      - docker_network
-
-  supabase-auth:
-    image: supabase/gotrue:latest
-    container_name: supabase-auth
-    restart: unless-stopped
-    environment:
-      GOTRUE_JWT_SECRET: ${SUPABASE_PASSWORD}
-      GOTRUE_DB_DRIVER: postgres
-      DB_NAMESPACE: auth
-      API_EXTERNAL_URL: http://localhost:9999
-    ports:
-      - "9999:9999"
-    networks:
-      - docker_network
-
-  supabase-meta:
-    image: supabase/postgres-meta:latest
-    container_name: supabase-meta
-    restart: unless-stopped
-    environment:
-      PG_META_PORT: 8080
-      PG_META_DB_HOST: supabase-db
-      PG_META_DB_PORT: 5432
-      PG_META_DB_NAME: postgres
-      PG_META_DB_USER: postgres
-      PG_META_DB_PASSWORD: ${SUPABASE_PASSWORD}
-    networks:
-      - docker_network
-
-  supabase-db:
-    image: supabase/postgres:15.1.0.117
-    container_name: supabase-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${SUPABASE_PASSWORD}
-      POSTGRES_DB: postgres
-    ports:
-      - "54322:5432"
-    volumes:
-      - supabase_db_data:/var/lib/postgresql/data
-    networks:
-      - docker_network
-
-EOF
-    
-    echo "Supabase:
-  Kong API: http://localhost:8000
-  Studio: http://localhost:8001
-  Auth: http://localhost:9999
-  Postgres: localhost:54322
-  Пароль: $SUPABASE_PASSWORD" >> "$CREDENTIALS_FILE"
+    log "✓ Portainer добавлен в compose"
 }
 
 # Установка n8n
 install_n8n() {
-    cat >> "$COMPOSE_FILE" << 'EOF'
+    N8N_PASSWORD=$(openssl rand -base64 12)
+    
+    cat >> "$COMPOSE_FILE" << EOF
 
   n8n:
     image: n8nio/n8n:latest
@@ -409,11 +397,12 @@ install_n8n() {
     environment:
       - N8N_BASIC_AUTH_ACTIVE=true
       - N8N_BASIC_AUTH_USER=admin
-      - N8N_BASIC_AUTH_PASSWORD=admin
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD}
+      - WEBHOOK_URL=http://localhost:5678/
     volumes:
       - n8n_data:/home/node/.n8n
     networks:
-      - docker_network
+      - app_network
 
 EOF
     
@@ -421,12 +410,16 @@ EOF
   Порт: 5678
   URL: http://localhost:5678
   Логин: admin
-  Пароль: admin (измените!)" >> "$CREDENTIALS_FILE"
+  Пароль: $N8N_PASSWORD" >> "$CREDENTIALS_FILE"
+    
+    log "✓ n8n добавлен в compose"
 }
 
 # ==========================================
 # ОСНОВНАЯ УСТАНОВКА
 # ==========================================
+
+log "=== НАЧАЛО УСТАНОВКИ ==="
 
 # Инициализация
 > "$CREDENTIALS_FILE"
@@ -437,6 +430,7 @@ install_docker
 
 # Генерация compose для каждого сервиса
 for service in $clean_choices; do
+    log "Обработка сервиса: $service"
     case "$service" in
         PostgreSQL)   install_postgresql ;;
         Qdrant)       install_qdrant ;;
@@ -444,7 +438,6 @@ for service in $clean_choices; do
         Apache)       install_apache ;;
         NginxProxy)   install_nginxproxy ;;
         Portainer)    install_portainer ;;
-        Supabase)     install_supabase ;;
         n8n)          install_n8n ;;
     esac
 done
@@ -459,19 +452,28 @@ volumes:
   portainer_data:
   n8n_data:
   npm_mysql_data:
-  supabase_db_data:
 
 networks:
-  docker_network:
+  app_network:
     driver: bridge
 EOF
 
+log "docker-compose.yml сгенерирован"
+
 # Запуск контейнеров
-dialog --infobox "\n🚀 Запуск контейнеров...\nЭто может занять несколько минут.\n" 8 60
+dialog --infobox "\n🚀 Запуск контейнеров...\nЭто может занять несколько минут.\nСледите за прогрессом в логах.\n" 8 60
 
 cd "$INSTALL_DIR"
 
-if docker-compose up -d; then
+log "Запуск docker-compose up -d..."
+
+if $COMPOSE_CMD up -d 2>> "$LOG_FILE"; then
+    log "✓ Все контейнеры запущены"
+    
+    # Проверка статуса
+    sleep 5
+    $COMPOSE_CMD ps >> "$LOG_FILE" 2>&1
+    
     # Чтение данных
     service_info=$(cat "$CREDENTIALS_FILE")
     
@@ -499,13 +501,31 @@ if docker-compose up -d; then
     echo "═══════════════════════════════════════════════════════════"
     echo "  Файл с данными: $CREDENTIALS_FILE"
     echo "  Docker Compose: $COMPOSE_FILE"
+    echo "  Логи установки: $LOG_FILE"
     echo "  ⚠️  Сохраните эти данные!"
     echo "═══════════════════════════════════════════════════════════"
     echo ""
     echo -e "${GREEN}✓ Все сервисы запущены!${NC}"
     echo ""
+    echo "Управление:"
+    echo "  cd $INSTALL_DIR"
+    echo "  $COMPOSE_CMD ps          - статус контейнеров"
+    echo "  $COMPOSE_CMD logs        - логи"
+    echo "  $COMPOSE_CMD down        - остановка"
+    echo ""
 else
-    dialog --title "✗ ОШИБКА" --msgbox "Ошибка при запуске контейнеров!\n\nПроверьте логи:\ndocker-compose logs" 10 60
+    log "✗ ОШИБКА при запуске контейнеров"
+    
+    dialog --title "✗ ОШИБКА" \
+           --msgbox "Ошибка при запуске контейнеров!\n\nПроверьте:\n  1. Интернет соединение\n  2. Свободное место на диске\n  3. Логи: $LOG_FILE\n\nКоманды для диагностики:\n  cd $INSTALL_DIR\n  $COMPOSE_CMD logs" 15 70
+    
     clear
+    echo -e "${RED}✗ Установка завершена с ошибкой${NC}"
+    echo ""
+    echo "Логи установки: $LOG_FILE"
+    echo ""
+    echo "Последние ошибки:"
+    tail -20 "$LOG_FILE"
+    echo ""
     exit 1
 fi
