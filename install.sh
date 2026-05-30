@@ -161,7 +161,7 @@ step_postgres() {
     dialog --clear --title "Шаг 2: PostgreSQL" \
         --extra-button --extra-label "Назад" \
         --ok-label "Далее" \
-        --inputbox "$hint" 50 70 "$PGPASSWORD" 2> "$TEMP_FILE"
+        --inputbox "$hint" 14 70 "$PGPASSWORD" 2> "$TEMP_FILE"
     local res=$?
     [ $res -eq 3 ] && return 1 # Назад
     [ $res -eq 1 ] && return 1 # Cancel
