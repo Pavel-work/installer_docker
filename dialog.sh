@@ -10,157 +10,203 @@ fi
 clear
 
 # ==========================================
-# 1. Приветствие (14x81)
+# Функция для получения ширины терминала
 # ==========================================
+get_term_width() {
+    tput cols 2>/dev/null || echo 80
+}
+
+get_term_height() {
+    tput lines 2>/dev/null || echo 24
+}
+
+TERM_WIDTH=$(get_term_width)
+TERM_HEIGHT=$(get_term_height)
+
+# ==========================================
+# 1. Приветствие - ДИНАМИЧЕСКОЕ
+# ==========================================
+welcome_text=(
+    "Добро пожаловать в установщик Docker контейнеров!"
+    ""
+    "Этот мастер поможет быстро установить и настроить сервисы."
+    ""
+    "Нажмите 'Начать установку' для продолжения."
+)
+
+# Рассчитываем высоту на основе количества строк
+welcome_height=$((${#welcome_text[@]} + 4))
+welcome_width=80
+
+# Проверяем, чтобы окно не было больше терминала
+if [ $welcome_width -gt $((TERM_WIDTH - 4)) ]; then
+    welcome_width=$((TERM_WIDTH - 4))
+fi
+
 dialog --backtitle "Docker Installer" \
        --title "Добро пожаловать в установщик Docker" \
        --yes-label "Начать установку" --no-label "Выход" \
-       --yesno "Добро пожаловать в установщик Docker контейнеров!\n\nЭтот мастер поможет быстро установить и настроить сервисы.\n\nНажмите 'Начать установку' для продолжения." 14 81
+       --yesno "$(printf '%s\n' "${welcome_text[@]}")" $welcome_height $welcome_width
 
 [ $? -ne 0 ] && { clear; exit 0; }
 
 # ==========================================
-# 2. Выбор сервисов (23x97)
+# 2. Выбор сервисов - ДИНАМИЧЕСКИЙ
 # ==========================================
-choices=$(dialog --stdout \
-                 --backtitle "Docker Installer - Выбор сервисов" \
-                 --title "Выбор сервисов" \
-                 --ok-label "Установить выбранные" --cancel-label "Отмена" \
-                 --checklist "Отметьте нужные сервисы (пробел - выбор):" 23 97 10 \
-                 "PostgreSQL"   "База данных PostgreSQL" OFF \
-                 "Qdrant"       "Векторная база Qdrant для AI" OFF \
-                 "Ollama"       "Локальная LLM Ollama" OFF \
-                 "Apache"       "Веб-сервер Apache HTTP" OFF \
-                 "NginxProxy"   "Nginx Proxy Manager" OFF \
-                 "Portainer"    "Управление Docker Portainer" OFF \
-                 "Supabase"     "Supabase Full Stack" OFF \
-                 "n8n"          "Автоматизация workflow n8n" OFF)
+# Список сервисов
+declare -a services=(
+    "PostgreSQL" "База данных PostgreSQL" OFF
+    "Qdrant" "Векторная база Qdrant для AI" OFF
+    "Ollama" "Локальная LLM Ollama" OFF
+    "Apache" "Веб-сервер Apache HTTP" OFF
+    "NginxProxy" "Nginx Proxy Manager" OFF
+    "Portainer" "Управление Docker Portainer" OFF
+    "Supabase" "Supabase Full Stack" OFF
+    "n8n" "Автоматизация workflow n8n" OFF
+)
 
-[ $? -ne 0 ] && { dialog --msgbox "Установка отменена.\n\nИзменения не внесены." 10 81; clear; exit 0; }
-[ -z "$choices" ] && { dialog --msgbox "Ошибка: Выберите хотя бы один сервис!" 10 81; clear; exit 1; }
+# Количество сервисов
+num_services=$(( ${#services[@]} / 3 ))
 
-clean_choices=$(echo "$choices" | xargs -n 1 | tr -d '"')
-
-# ==========================================
-# 3. Подтверждение - ДИНАМИЧЕСКИЙ РАЗМЕР
-# ==========================================
-# Считаем количество выбранных сервисов
-num_services=$(echo "$clean_choices" | wc -l)
-
-# Формируем список сервисов (каждый с новой строки)
-services_list=$(echo "$clean_choices" | sed 's/^/    • /')
-
-# Рассчитываем высоту окна динамически
-# Базовая высота (заголовок + текст + кнопки) = 10 строк
-# + по 1 строке на каждый сервис
-base_height=10
-dynamic_height=$((base_height + num_services))
-
-# Ограничиваем максимальную высоту (чтобы не было слишком высоко)
-if [ $dynamic_height -gt 25 ]; then
-    dynamic_height=25
+# Высота: заголовок + подсказка + список сервисов + отступы
+list_height=10
+if [ $num_services -gt 10 ]; then
+    list_height=$num_services
 fi
 
-# Ширина фиксированная - достаточно большая
-width=90
+checklist_height=$((list_height + 6))
+checklist_width=$((TERM_WIDTH - 8))
+if [ $checklist_width -gt 100 ]; then
+    checklist_width=100
+fi
+
+choices=$(dialog --stdout \
+                 --backtitle "Docker Installer - Выбор сервисов" \
+                 --title "Выбор сервисов для установки" \
+                 --ok-label "Установить выбранные" --cancel-label "Отмена" \
+                 --checklist "Отметьте нужные сервисы (пробел - выбор/снятие):" \
+                 $checklist_height $checklist_width $list_height \
+                 "${services[@]}")
+
+[ $? -ne 0 ] && { dialog --msgbox "Установка отменена.\n\nИзменения не внесены." 8 60; clear; exit 0; }
+[ -z "$choices" ] && { dialog --msgbox "Ошибка: Выберите хотя бы один сервис!" 8 60; clear; exit 1; }
+
+clean_choices=$(echo "$choices" | xargs -n 1 | tr -d '"')
+num_selected=$(echo "$clean_choices" | wc -l)
+
+# ==========================================
+# 3. Подтверждение - ДИНАМИЧЕСКОЕ
+# ==========================================
+services_list=$(echo "$clean_choices" | sed 's/^/    • /')
+
+# Динамический расчет высоты
+base_height=12
+dynamic_height=$((base_height + num_selected))
+
+# Ограничиваем высоту
+if [ $dynamic_height -gt 28 ]; then
+    dynamic_height=28
+fi
+
+confirm_width=$((TERM_WIDTH - 8))
+if [ $confirm_width -gt 90 ]; then
+    confirm_width=90
+fi
 
 dialog --title "Подтверждение установки" \
        --yes-label "Установить" --no-label "Отмена" \
-       --yesno "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n          ПОДТВЕРДИТЕ УСТАНОВКУ\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nБудут выполнены следующие действия:\n\n  1. Установка Docker Engine\n  2. Установка Docker Compose\n  3. Настройка и запуск сервисов:\n\n${services_list}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nПродолжить установку?" $dynamic_height $width
+       --yesno "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n          ПОДТВЕРДИТЕ УСТАНОВКУ\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nБудут выполнены:\n\n  1. Установка Docker Engine\n  2. Установка Docker Compose\n  3. Настройка сервисов (${num_selected} шт.):\n\n${services_list}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nПродолжить?" $dynamic_height $confirm_width
 
 [ $? -ne 0 ] && { clear; exit 0; }
 
 # ==========================================
-# 4. Установка (имитация) (12x81 / 13x81)
+# 4. Установка - ДИНАМИЧЕСКАЯ
 # ==========================================
-dialog --infobox "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n      ШАГ 1: УСТАНОВКА DOCKER\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n  Загрузка и установка Docker...\n  Настройка служб...\n\n  Пожалуйста, подождите.\n\n  [##########..................] 40%\n" 12 81
+# Шаг 1
+step1_height=$((8 + num_selected / 2))
+dialog --infobox "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n      ШАГ 1: УСТАНОВКА DOCKER ENGINE\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n  Загрузка репозиториеv...\n  Установка Docker Engine...\n  Настройка служб...\n\n  [████████░░░░░░░░░░░░░░░░] 40%\n" $step1_height 80
 sleep 2
 
-dialog --infobox "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n      ШАГ 2: УСТАНОВКА СЕРВИСОВ\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n  ✓ Docker установлен!\n\n  Установка сервисов:\n\n$(echo "$clean_choices" | sed 's/^/     ⚙ /')\n\n  [####################......] 80%\n" 13 81
+# Шаг 2
+step2_height=$((10 + num_selected))
+dialog --infobox "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n      ШАГ 2: УСТАНОВКА СЕРВИСОВ\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n  ✓ Docker Engine установлен!\n\n  Установка и настройка:\n\n$(echo "$clean_choices" | sed 's/^/    ⚙ /')\n\n  [████████████████████░░] 85%\n" $step2_height 80
 sleep 2
 
 # ==========================================
-# 5. Генерация данных
+# 5. Генерация данных доступа
 # ==========================================
 service_info=""
+max_line_length=0
+
 for service in $clean_choices; do
     case "$service" in
         PostgreSQL)
             pass=$(openssl rand -base64 14)
-            service_info="${service_info}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n📦 PostgreSQL"
-            service_info="${service_info}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n   Порт: 5432"
-            service_info="${service_info}\n   Пользователь: postgres"
-            service_info="${service_info}\n   Пароль: $pass"
-            service_info="${service_info}\n   URL: localhost:5432" ;;
+            block="\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📦 PostgreSQL\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n   Порт: 5432\n   Пользователь: postgres\n   Пароль: $pass\n   URL: localhost:5432"
+            service_info="${service_info}${block}"
+            ;;
         Qdrant)
-            service_info="${service_info}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n📦 Qdrant"
-            service_info="${service_info}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n   Порт REST: 6333"
-            service_info="${service_info}\n   Порт gRPC: 6334"
-            service_info="${service_info}\n   URL: http://localhost:6333" ;;
+            block="\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📦 Qdrant\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n   Порт REST: 6333\n   Порт gRPC: 6334\n   URL: http://localhost:6333"
+            service_info="${service_info}${block}"
+            ;;
         Ollama)
-            service_info="${service_info}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n📦 Ollama"
-            service_info="${service_info}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n   Порт: 11434"
-            service_info="${service_info}\n   API: http://localhost:11434"
-            service_info="${service_info}\n   Пример: ollama pull llama2" ;;
+            block="\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📦 Ollama\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n   Порт: 11434\n   API: http://localhost:11434\n   Пример: ollama pull llama2"
+            service_info="${service_info}${block}"
+            ;;
         Apache)
-            service_info="${service_info}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n📦 Apache"
-            service_info="${service_info}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n   HTTP: 80"
-            service_info="${service_info}\n   HTTPS: 443"
-            service_info="${service_info}\n   URL: http://localhost" ;;
+            block="\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📦 Apache\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n   HTTP: 80\n   HTTPS: 443\n   URL: http://localhost"
+            service_info="${service_info}${block}"
+            ;;
         NginxProxy)
             pass=$(openssl rand -base64 14)
-            service_info="${service_info}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n📦 Nginx Proxy Manager"
-            service_info="${service_info}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n   HTTP: 80"
-            service_info="${service_info}\n   HTTPS: 443"
-            service_info="${service_info}\n   Панель: http://localhost:81"
-            service_info="${service_info}\n   Email: admin@example.com"
-            service_info="${service_info}\n   Пароль: $pass" ;;
+            block="\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📦 Nginx Proxy Manager\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n   HTTP: 80\n   HTTPS: 443\n   Панель: http://localhost:81\n   Email: admin@example.com\n   Пароль: $pass"
+            service_info="${service_info}${block}"
+            ;;
         Portainer)
-            service_info="${service_info}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n📦 Portainer"
-            service_info="${service_info}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n   HTTP: 9000"
-            service_info="${service_info}\n   HTTPS: 9443"
-            service_info="${service_info}\n   URL: https://localhost:9443" ;;
+            block="\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📦 Portainer\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n   HTTP: 9000\n   HTTPS: 9443\n   URL: https://localhost:9443"
+            service_info="${service_info}${block}"
+            ;;
         Supabase)
-            service_info="${service_info}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n📦 Supabase"
-            service_info="${service_info}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n   Kong: http://localhost:8000"
-            service_info="${service_info}\n   Studio: http://localhost:8001"
-            service_info="${service_info}\n   Postgres: localhost:54322" ;;
+            block="\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📦 Supabase\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n   Kong: http://localhost:8000\n   Studio: http://localhost:8001\n   Postgres: localhost:54322"
+            service_info="${service_info}${block}"
+            ;;
         n8n)
-            service_info="${service_info}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n📦 n8n"
-            service_info="${service_info}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            service_info="${service_info}\n   Порт: 5678"
-            service_info="${service_info}\n   URL: http://localhost:5678" ;;
+            block="\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📦 n8n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n   Порт: 5678\n   URL: http://localhost:5678"
+            service_info="${service_info}${block}"
+            ;;
     esac
 done
 
 # ==========================================
-# 6. Готово + Информация (25x97)
+# 6. Финальное окно - ДИНАМИЧЕСКОЕ
 # ==========================================
+# Считаем количество строк в service_info
+info_lines=$(echo -e "$service_info" | wc -l)
+final_height=$((15 + info_lines))
+
+# Ограничиваем максимальную высоту
+if [ $final_height -gt 35 ]; then
+    final_height=35
+fi
+
+final_width=$((TERM_WIDTH - 8))
+if [ $final_width -gt 95 ]; then
+    final_width=95
+fi
+
 dialog --title "✓ Установка завершена" \
        --backtitle "Docker Installer - Данные доступа" \
-       --msgbox "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n       ✓ УСТАНОВКА ЗАВЕРШЕНА!\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nВсе сервисы установлены и запущены.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n            ДАННЫЕ ДОСТУПА:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${service_info}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n            ⚠️  ВАЖНО!\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n  • Сохраните эти данные!\n  • Пароли сгенерированы автоматически\n  • Документация: /opt/docker/docs\n\n  Спасибо за использование!\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" 25 97
+       --msgbox "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n       ✓ УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nВсе сервисы установлены и запущены.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n            ДАННЫЕ ДОСТУПА:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${service_info}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n            ⚠️  ВАЖНО!\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n  • Сохраните эти данные!\n  • Пароли сгенерированы автоматически\n  • Для изменения паролей отредактируйте .env\n\n  Спасибо за использование Docker Installer!\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" $final_height $final_width
 
+# ==========================================
+# Вывод в консоль
+# ==========================================
 clear
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "       ✓ УСТАНОВКА ЗАВЕРШЕНА!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo "Установленные сервисы:"
+echo "Установленные сервисы (${num_selected}):"
 echo -e "$clean_choices" | sed 's/^/  ✓ /'
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
