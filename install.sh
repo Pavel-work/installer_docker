@@ -1,20 +1,8 @@
 #!/bin/bash
 
 # ==========================================
-# Docker Installer - ИСПРАВЛЕННАЯ ВЕРСИЯ
+# Docker Installer - ИСПРАВЛЕННЫЙ v3
 # ==========================================
-
-# Проверка root прав
-if [ "$EUID" -ne 0 ]; then 
-    echo "Ошибка: запустите скрипт от root (sudo ./script.sh)"
-    exit 1
-fi
-
-# Проверка dialog
-if ! command -v dialog &> /dev/null; then
-    echo "Установка dialog..."
-    apt-get update && apt-get install -y dialog
-fi
 
 # Цвета
 RED='\033[0;31m'
@@ -38,21 +26,27 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-# Проверка порта
-check_port() {
-    local port=$1
-    if ss -tlnp | grep -q ":${port} "; then
-        return 1  # Порт занят
-    fi
-    return 0  # Порт свободен
-}
+log "=== НАЧАЛО УСТАНОВКИ ==="
+
+# Проверка dialog
+if ! command -v dialog &> /dev/null; then
+    echo -e "${YELLOW}Установка dialog...${NC}"
+    sudo apt-get update && sudo apt-get install -y dialog
+fi
+
+# Проверка sudo
+if ! sudo -v &> /dev/null; then
+    echo -e "${RED}Ошибка: требуются права sudo${NC}"
+    echo "Запустите: sudo bash $0"
+    exit 1
+fi
 
 clear
 
 # ==========================================
 # 1. Приветствие
 # ==========================================
-dialog --backtitle "Docker Installer v2.0" \
+dialog --backtitle "Docker Installer v3.0" \
        --title "Добро пожаловать" \
        --yes-label "Начать" --no-label "Выход" \
        --yesno "Добро пожаловать в установщик Docker!\n\nБудут установлены Docker Engine и выбранные сервисы.\n\nТребуется: sudo, интернет, свободные порты." 12 70
@@ -82,39 +76,7 @@ clean_choices=$(echo "$choices" | xargs -n 1 | tr -d '"')
 num_selected=$(echo "$clean_choices" | wc -l)
 
 # ==========================================
-# 3. Проверка портов
-# ==========================================
-port_conflicts=""
-declare -A service_ports=(
-    ["PostgreSQL"]="5432"
-    ["Qdrant"]="6333,6334"
-    ["Ollama"]="11434"
-    ["Apache"]="80,443"
-    ["NginxProxy"]="80,81,443"
-    ["Portainer"]="9000,9443"
-    ["n8n"]="5678"
-)
-
-for service in $clean_choices; do
-    if [ -n "${service_ports[$service]}" ]; then
-        IFS=',' read -ra ports <<< "${service_ports[$service]}"
-        for port in "${ports[@]}"; do
-            if ! check_port $port; then
-                port_conflicts="${port_conflicts}\n  • $service - порт $port ЗАНЯТ"
-            fi
-        done
-    fi
-done
-
-if [ -n "$port_conflicts" ]; then
-    dialog --title "⚠️ КОНФЛИКТ ПОРТОВ" \
-           --msgbox "Следующие порты уже используются:\n${port_conflicts}\n\nОсвободите порты или выберите другие сервисы." 15 70
-    clear
-    exit 1
-fi
-
-# ==========================================
-# 4. Подтверждение
+# 3. Подтверждение
 # ==========================================
 services_list=$(echo "$clean_choices" | sed 's/^/    • /')
 
@@ -128,65 +90,72 @@ dialog --title "Подтверждение" \
 # ФУНКЦИИ УСТАНОВКИ
 # ==========================================
 
-# Определение команды Docker Compose
-detect_compose() {
-    if command -v docker-compose &> /dev/null; then
-        echo "docker-compose"
-    elif docker compose version &> /dev/null; then
-        echo "docker compose"
-    else
-        echo ""
-    fi
-}
-
-COMPOSE_CMD=$(detect_compose)
-
-# Установка Docker
+# Проверка и установка Docker
 install_docker() {
     log "Проверка Docker..."
+    dialog --infobox "\n📦 Проверка Docker...\n" 6 60
     
+    # Установка Docker если не установлен
     if ! command -v docker &> /dev/null; then
         log "Установка Docker Engine..."
-        dialog --infobox "\n📦 Установка Docker Engine...\n" 6 60
+        dialog --infobox "\n📦 Установка Docker Engine...\nЭто займет несколько минут." 8 60
         
         curl -fsSL https://get.docker.com -o /tmp/get-docker.sh 2>> "$LOG_FILE"
-        sh /tmp/get-docker.sh 2>> "$LOG_FILE"
+        sudo sh /tmp/get-docker.sh 2>> "$LOG_FILE"
         rm -f /tmp/get-docker.sh
-        
-        systemctl enable docker 2>> "$LOG_FILE"
-        systemctl start docker 2>> "$LOG_FILE"
         
         log "✓ Docker Engine установлен"
     else
         log "Docker уже установлен"
     fi
     
-    # Установка Docker Compose если нужно
-    if [ -z "$COMPOSE_CMD" ]; then
+    # Добавление текущего пользователя в группу docker
+    log "Добавление пользователя в группу docker..."
+    sudo usermod -aG docker $USER 2>> "$LOG_FILE"
+    
+    # Перезапуск Docker
+    sudo systemctl enable docker 2>> "$LOG_FILE"
+    sudo systemctl restart docker 2>> "$LOG_FILE"
+    
+    # Проверка Docker Compose
+    if command -v docker-compose &> /dev/null; then
+        COMPOSE_CMD="docker-compose"
+        log "✓ docker-compose найден"
+    elif docker compose version &> /dev/null 2>&1; then
+        COMPOSE_CMD="docker compose"
+        log "✓ docker compose найден (v2)"
+    else
         log "Установка Docker Compose..."
         dialog --infobox "\n📦 Установка Docker Compose...\n" 6 60
         
         DOCKER_COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")')
-        curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" \
+        sudo curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" \
             -o /usr/local/bin/docker-compose 2>> "$LOG_FILE"
-        chmod +x /usr/local/bin/docker-compose
+        sudo chmod +x /usr/local/bin/docker-compose
         
         COMPOSE_CMD="docker-compose"
         log "✓ Docker Compose установлен"
     fi
     
-    echo -e "${GREEN}✓ Docker готов${NC}"
+    # Проверка работы Docker
+    if sudo docker run --rm hello-world &> /dev/null; then
+        log "✓ Docker работает корректно"
+        echo -e "${GREEN}✓ Docker готов${NC}"
+    else
+        log "✗ Docker не работает!"
+        echo -e "${RED}✗ Ошибка Docker${NC}"
+        sleep 2
+    fi
+    
     sleep 1
 }
 
-# Генерация docker-compose.yml
+# Генерация docker-compose.yml (БЕЗ version!)
 generate_compose() {
     cat > "$COMPOSE_FILE" << 'EOF'
-version: '3.8'
-
 services:
 EOF
-    log "Создан docker-compose.yml"
+    log "Создан docker-compose.yml (без version)"
 }
 
 # Установка PostgreSQL
@@ -218,7 +187,7 @@ EOF
   Пароль: $POSTGRES_PASSWORD
   URL: localhost:5432" >> "$CREDENTIALS_FILE"
     
-    log "✓ PostgreSQL добавлен в compose"
+    log "✓ PostgreSQL добавлен"
 }
 
 # Установка Qdrant
@@ -244,7 +213,7 @@ EOF
   gRPC: localhost:6334
   Dashboard: http://localhost:6333/dashboard" >> "$CREDENTIALS_FILE"
     
-    log "✓ Qdrant добавлен в compose"
+    log "✓ Qdrant добавлен"
 }
 
 # Установка Ollama
@@ -269,7 +238,7 @@ EOF
   API: http://localhost:11434
   Команда: ollama pull llama2" >> "$CREDENTIALS_FILE"
     
-    log "✓ Ollama добавлен в compose"
+    log "✓ Ollama добавлен"
 }
 
 # Установка Apache
@@ -298,7 +267,7 @@ EOF
   HTTPS: https://localhost:443
   Директория: $INSTALL_DIR/apache/html" >> "$CREDENTIALS_FILE"
     
-    log "✓ Apache добавлен в compose"
+    log "✓ Apache добавлен"
 }
 
 # Установка Nginx Proxy Manager
@@ -352,7 +321,7 @@ EOF
   Email: admin@example.com
   Пароль: changeme (измените при первом входе)" >> "$CREDENTIALS_FILE"
     
-    log "✓ Nginx Proxy Manager добавлен в compose"
+    log "✓ Nginx Proxy Manager добавлен"
 }
 
 # Установка Portainer
@@ -379,7 +348,7 @@ EOF
   HTTPS: https://localhost:9443
   Создайте admin при первом входе" >> "$CREDENTIALS_FILE"
     
-    log "✓ Portainer добавлен в compose"
+    log "✓ Portainer добавлен"
 }
 
 # Установка n8n
@@ -412,14 +381,12 @@ EOF
   Логин: admin
   Пароль: $N8N_PASSWORD" >> "$CREDENTIALS_FILE"
     
-    log "✓ n8n добавлен в compose"
+    log "✓ n8n добавлен"
 }
 
 # ==========================================
 # ОСНОВНАЯ УСТАНОВКА
 # ==========================================
-
-log "=== НАЧАЛО УСТАНОВКИ ==="
 
 # Инициализация
 > "$CREDENTIALS_FILE"
@@ -430,7 +397,7 @@ install_docker
 
 # Генерация compose для каждого сервиса
 for service in $clean_choices; do
-    log "Обработка сервиса: $service"
+    log "Обработка: $service"
     case "$service" in
         PostgreSQL)   install_postgresql ;;
         Qdrant)       install_qdrant ;;
@@ -458,21 +425,23 @@ networks:
     driver: bridge
 EOF
 
-log "docker-compose.yml сгенерирован"
+log "docker-compose.yml готов"
 
 # Запуск контейнеров
-dialog --infobox "\n🚀 Запуск контейнеров...\nЭто может занять несколько минут.\nСледите за прогрессом в логах.\n" 8 60
+dialog --infobox "\n🚀 Запуск контейнеров...\nЭто может занять несколько минут.\n" 8 60
 
 cd "$INSTALL_DIR"
 
-log "Запуск docker-compose up -d..."
+log "Запуск $COMPOSE_CMD up -d..."
 
-if $COMPOSE_CMD up -d 2>> "$LOG_FILE"; then
-    log "✓ Все контейнеры запущены"
+if sudo $COMPOSE_CMD up -d 2>> "$LOG_FILE"; then
+    log "✓ Контейнеры запущены"
     
-    # Проверка статуса
+    # Ждем пока поднимутся
     sleep 5
-    $COMPOSE_CMD ps >> "$LOG_FILE" 2>&1
+    
+    # Показываем статус
+    sudo $COMPOSE_CMD ps >> "$LOG_FILE" 2>&1
     
     # Чтение данных
     service_info=$(cat "$CREDENTIALS_FILE")
@@ -501,31 +470,34 @@ if $COMPOSE_CMD up -d 2>> "$LOG_FILE"; then
     echo "═══════════════════════════════════════════════════════════"
     echo "  Файл с данными: $CREDENTIALS_FILE"
     echo "  Docker Compose: $COMPOSE_FILE"
-    echo "  Логи установки: $LOG_FILE"
-    echo "  ⚠️  Сохраните эти данные!"
+    echo "  Логи: $LOG_FILE"
     echo "═══════════════════════════════════════════════════════════"
     echo ""
     echo -e "${GREEN}✓ Все сервисы запущены!${NC}"
     echo ""
-    echo "Управление:"
+    echo "Управление (sudo):"
     echo "  cd $INSTALL_DIR"
-    echo "  $COMPOSE_CMD ps          - статус контейнеров"
-    echo "  $COMPOSE_CMD logs        - логи"
-    echo "  $COMPOSE_CMD down        - остановка"
+    echo "  sudo $COMPOSE_CMD ps          - статус"
+    echo "  sudo $COMPOSE_CMD logs        - логи"
+    echo "  sudo $COMPOSE_CMD down        - остановка"
+    echo ""
+    echo -e "${YELLOW}ВАЖНО: Для доступа без sudo выполните:${NC}"
+    echo "  newgrp docker"
+    echo "  (или перезайдите в систему)"
     echo ""
 else
-    log "✗ ОШИБКА при запуске контейнеров"
+    log "✗ ОШИБКА запуска"
     
     dialog --title "✗ ОШИБКА" \
-           --msgbox "Ошибка при запуске контейнеров!\n\nПроверьте:\n  1. Интернет соединение\n  2. Свободное место на диске\n  3. Логи: $LOG_FILE\n\nКоманды для диагностики:\n  cd $INSTALL_DIR\n  $COMPOSE_CMD logs" 15 70
+           --msgbox "Ошибка при запуске!\n\nПроверьте:\n  1. Интернет\n  2. Место на диске (df -h)\n  3. Логи: $LOG_FILE\n\nКоманды:\n  cd $INSTALL_DIR\n  sudo $COMPOSE_CMD logs" 15 70
     
     clear
-    echo -e "${RED}✗ Установка завершена с ошибкой${NC}"
+    echo -e "${RED}✗ Ошибка установки${NC}"
     echo ""
-    echo "Логи установки: $LOG_FILE"
+    echo "Логи: $LOG_FILE"
     echo ""
     echo "Последние ошибки:"
-    tail -20 "$LOG_FILE"
+    tail -30 "$LOG_FILE"
     echo ""
     exit 1
 fi
