@@ -3,7 +3,7 @@ curl -fsSL https://raw.githubusercontent.com/Pavel-work/installer_docker/main/in
 ```
 отладка 
 ```bash
-curl 
+curl -fsSL https://raw.githubusercontent.com/Pavel-work/installer_docker/main/dialog.sh -o dialog.sh && sudo bash dialog.sh
 ```
 
 ```bash
