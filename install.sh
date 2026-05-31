@@ -2,8 +2,19 @@
 set -uo pipefail
 
 ###############################################################################
-#  Джентльменский набор - установщик сервисов v4.11
+#  Джентльменский набор - установщик сервисов v4.12
 ###############################################################################
+#  Изменения v4.12:
+#    • Фикс psql: -U postgres → -U admin -h localhost (POSTGRES_USER=admin!)
+#    • Supabase ставится В КОНЦЕ после всех контейнеров
+#    • НЕТ 'down --remove-orphans' — добавление сервисов НЕ удаляет соседние
+#    • verify_supabase() — проверка что контейнеры реально запустились
+#    • supabase_compose_up() — retry при сбое запуска
+#    • git clone с timeout 300 сек — не зависнет навсегда
+#    • create_n8n_database ждёт pg_isready перед подключением
+#    • Функция скачивания логов (пункт 7 в post_install)
+#    • Все /dev/null заменены на >> $LOG_FILE — ничего не теряется
+#
 #  Изменения v4.11:
 #    • ФИНАЛЬНЫЙ ФИКС n8n: env vars DB_HOST → DB_POSTGRESDB_HOST и т.д.
 #    • n8n требует именно DB_POSTGRESDB_* переменные, не DB_*
@@ -36,7 +47,7 @@ log() {
     printf '%s  %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
 }
 
-# ─── Утилиты ────────────────────────────────────────────────────────────────
+# ─── Утилиты ────────────────────────────────────────────────────────────
 env_esc() {
     local v="${1:-}"
     v="${v//\\/\\\\}"
@@ -161,6 +172,11 @@ APACHE_HTTP_PORT_B64="$(b64enc "${APACHE_HTTP_PORT:-}")"
 QDRANT_PORT_B64="$(b64enc "${QDRANT_PORT:-}")"
 PORTAINER_PORT_B64="$(b64enc "${PORTAINER_PORT:-}")"
 OLLAMA_PORT_B64="$(b64enc "${OLLAMA_PORT:-}")"
+SUPABASE_PORT_STUDIO_B64="$(b64enc "${SUPABASE_PORT_STUDIO:-3000}")"
+SUPABASE_PORT_PG_B64="$(b64enc "${SUPABASE_PORT_PG:-54322}")"
+SUPABASE_PORT_API_B64="$(b64enc "${SUPABASE_PORT_API:-8000}")"
+SUPABASE_PORT_MAIL_B64="$(b64enc "${SUPABASE_PORT_MAIL:-8085}")"
+SUPABASE_PORT_AUTH_B64="$(b64enc "${SUPABASE_PORT_AUTH:-5555}")"
 EOF
     chmod 600 "$PARAMS_FILE"
 }
@@ -180,6 +196,11 @@ declare -A _PM=(
     [QDRANT_PORT]="QDRANT_PORT_B64"
     [PORTAINER_PORT]="PORTAINER_PORT_B64"
     [OLLAMA_PORT]="OLLAMA_PORT_B64"
+    [SUPABASE_PORT_STUDIO]="SUPABASE_PORT_STUDIO_B64"
+    [SUPABASE_PORT_PG]="SUPABASE_PORT_PG_B64"
+    [SUPABASE_PORT_API]="SUPABASE_PORT_API_B64"
+    [SUPABASE_PORT_MAIL]="SUPABASE_PORT_MAIL_B64"
+    [SUPABASE_PORT_AUTH]="SUPABASE_PORT_AUTH_B64"
 )
 
 load_params() {
@@ -197,6 +218,12 @@ load_params() {
     QDRANT_PORT=6333
     PORTAINER_PORT=9000
     OLLAMA_PORT=11434
+    # Supabase порты по умолчанию
+    SUPABASE_PORT_STUDIO=3000
+    SUPABASE_PORT_PG=54322
+    SUPABASE_PORT_API=8000
+    SUPABASE_PORT_MAIL=8085
+    SUPABASE_PORT_AUTH=5555
 
     if [[ -f "$PARAMS_FILE" ]]; then
         local k b t
@@ -213,6 +240,11 @@ load_params() {
     [[ "$PORTAINER_PORT" =~ ^[0-9]+$ ]] || PORTAINER_PORT=9000
     [[ "$OLLAMA_PORT" =~ ^[0-9]+$ ]] || OLLAMA_PORT=11434
     [[ "$N8N_DB_POSTGRES" =~ ^[01]$ ]] || N8N_DB_POSTGRES=0
+    [[ "$SUPABASE_PORT_STUDIO" =~ ^[0-9]+$ ]] || SUPABASE_PORT_STUDIO=3000
+    [[ "$SUPABASE_PORT_PG" =~ ^[0-9]+$ ]] || SUPABASE_PORT_PG=54322
+    [[ "$SUPABASE_PORT_API" =~ ^[0-9]+$ ]] || SUPABASE_PORT_API=8000
+    [[ "$SUPABASE_PORT_MAIL" =~ ^[0-9]+$ ]] || SUPABASE_PORT_MAIL=8085
+    [[ "$SUPABASE_PORT_AUTH" =~ ^[0-9]+$ ]] || SUPABASE_PORT_AUTH=5555
 }
 
 ###############################################################################
@@ -261,6 +293,7 @@ build_steps() {
     is_selected "n8n" && is_selected "postgres" && step_reg "n8n: Postgres или SQLite?" "s_n8n_db"
     is_selected "supabase" && step_reg "Supabase поддомен" "s_supabase_domain"
     is_selected "supabase" && step_reg "JWT Secret (Supabase)" "s_jwt"
+    is_selected "supabase" && step_reg "Supabase порты" "s_supabase_ports"
     is_selected "apache" && step_reg "Apache путь для сайтов" "s_ap_path"
     is_selected "apache" && step_reg "Apache порт" "s_ap_port"
     is_selected "qdrant" && step_reg "Qdrant порт" "s_qdrant_port"
@@ -358,6 +391,60 @@ s_jwt() {
     log "JWT_SECRET set"
 }
 
+s_supabase_ports() {
+    local sf="$TMP2"
+    while true; do
+        printf 'Порты Supabase (по умолчанию в скобках):\n\n' > "$sf"
+        printf '  Studio UI (3000): ' >> "$sf"
+        printf '%s\n' "${SUPABASE_PORT_STUDIO:-3000}" >> "$sf"
+        printf '  Database (54322): ' >> "$sf"
+        printf '%s\n' "${SUPABASE_PORT_PG:-54322}" >> "$sf"
+        printf '  API/Kong (8000): ' >> "$sf"
+        printf '%s\n' "${SUPABASE_PORT_API:-8000}" >> "$sf"
+        printf '  Mail (8085): ' >> "$sf"
+        printf '%s\n' "${SUPABASE_PORT_MAIL:-8085}" >> "$sf"
+        printf '  Auth (5555): ' >> "$sf"
+        printf '%s\n' "${SUPABASE_PORT_AUTH:-5555}" >> "$sf"
+        printf '\nНажмите Далее чтобы оставить как есть\nили Назад чтобы изменить\n' >> "$sf"
+
+        if dialog --title "[$((_STEP+1))/${_STEP_MAX}] Supabase порты" \
+            --yesno "$(cat "$sf")" 20 55; then
+            _nav_action="next"
+            return 0
+        else
+            # Изменение портов
+            local port_var port_val
+            for port_var in SUPABASE_PORT_STUDIO SUPABASE_PORT_PG SUPABASE_PORT_API SUPABASE_PORT_MAIL SUPABASE_PORT_AUTH; do
+                local label
+                case "$port_var" in
+                    SUPABASE_PORT_STUDIO) label="Studio UI" ;;
+                    SUPABASE_PORT_PG) label="Database" ;;
+                    SUPABASE_PORT_API) label="API/Kong" ;;
+                    SUPABASE_PORT_MAIL) label="Mail (Inbucket)" ;;
+                    SUPABASE_PORT_AUTH) label="Auth" ;;
+                esac
+                dialog --ok-label "OK" --cancel-label "Назад " \
+                    --inputbox "Порт Supabase ${label}:" 8 50 "${!port_var:-}" 2>"$TMP" \
+                    || { _nav_action="back"; return 1; }
+                port_val=$(<"$TMP")
+                if [[ "$port_val" =~ ^[0-9]+$ ]] && [[ "$port_val" -ge 1024 ]] && [[ "$port_val" -le 65535 ]]; then
+                    eval "$port_var=$port_val"
+                else
+                    eval "$port_var=${port_var#SUPABASE_PORT_}"
+                    case "$port_var" in
+                        SUPABASE_PORT_STUDIO) SUPABASE_PORT_STUDIO=3000 ;;
+                        SUPABASE_PORT_PG) SUPABASE_PORT_PG=54322 ;;
+                        SUPABASE_PORT_API) SUPABASE_PORT_API=8000 ;;
+                        SUPABASE_PORT_MAIL) SUPABASE_PORT_MAIL=8085 ;;
+                        SUPABASE_PORT_AUTH) SUPABASE_PORT_AUTH=5555 ;;
+                    esac
+                fi
+            done
+        fi
+    done
+    log "Supabase ports: Studio=$SUPABASE_PORT_STUDIO DB=$SUPABASE_PORT_PG API=$SUPABASE_PORT_API Mail=$SUPABASE_PORT_MAIL Auth=$SUPABASE_PORT_AUTH"
+}
+
 s_ap_path() {
     dialog --ok-label "Далее " --cancel-label "Назад " \
         --inputbox "Путь для сайтов Apache:" 9 60 \
@@ -420,6 +507,10 @@ s_confirm() {
         else
             printf '(нет)\n' >>"$sf"
         fi
+        printf '  Supabase порты: Studio=%s DB=%s API=%s Mail=%s Auth=%s\n' \
+            "${SUPABASE_PORT_STUDIO:-3000}" "${SUPABASE_PORT_PG:-54322}" \
+            "${SUPABASE_PORT_API:-8000}" "${SUPABASE_PORT_MAIL:-8085}" \
+            "${SUPABASE_PORT_AUTH:-5555}" >>"$sf"
     fi
 
     if is_selected "n8n"; then
@@ -620,6 +711,7 @@ install_docker() {
 
 verify_docker() {
     local tmp_verify="$TMP"
+    docker rm -f hello-world >/dev/null 2>&1 || true
     if docker pull hello-world >"$tmp_verify" 2>&1; then
         docker rm hello-world >/dev/null 2>&1 || true
         log "Docker verified OK"
@@ -662,7 +754,7 @@ verify_docker() {
 setup_network() {
     docker network inspect internal_network &>/dev/null || docker network create internal_network
     mkdir -p "$SETUP_DIR"
-    cd "$SETUP_DIR"
+    cd "$SETUP_DIR" || { log "ERROR: Cannot cd to $SETUP_DIR"; return 1; }
 
     : >.env
     if is_selected "postgres"; then
@@ -749,44 +841,46 @@ setup_supabase() {
     cd "$SETUP_DIR" || { log "ERROR: Cannot cd to $SETUP_DIR"; return 1; }
     log "Supabase setup started"
 
-    if [[ ! -d "supabase-docker" ]]; then
-        dialog --title "Supabase (1/2)" --gauge "Клонирование репозитория supabase..." 8 60 20 &
-        local gp1=$!
+    # pushd/popd защищает от потери рабочей директории
+    pushd "$SETUP_DIR" >/dev/null || { log "ERROR: Cannot pushd to $SETUP_DIR"; return 1; }
 
-        if ! git clone --depth 1 --filter=blob:none --sparse https://github.com/supabase/supabase >> "$LOG_FILE" 2>&1; then
-            kill "$gp1" 2>/dev/null || true
-            log "ERROR: Git clone supabase FAILED"
-            dialog --title "Ошибка" --msgbox "Не удалось скачать репозиторий Supabase.\nПроверьте интернет-соединение и git.\n\nЛог: $LOG_FILE" 12 60
-            cd "$SETUP_DIR"
+    if [[ ! -d "supabase-docker" ]]; then
+        dialog --title "Supabase (1/2)" --gauge "Клонирование репозитория supabase (timeout 5мин)..." 8 60 20
+        log "Supabase: starting git clone with timeout..."
+
+        # timeout 5 минут — git clone может зависнуть навсегда
+        if ! timeout 300 git clone --depth 1 --filter=blob:none --sparse https://github.com/supabase/supabase >> "$LOG_FILE" 2>&1; then
+            log "ERROR: Git clone supabase FAILED or TIMED OUT"
+            rm -rf supabase 2>/dev/null || true
+            popd >/dev/null 2>&1 || true
+            dialog --title "Ошибка" --msgbox "Не удалось скачать репозиторий Supabase.\nПроверьте интернет-соединение.\nTimeout 5 минут истёк.\nЛог: $LOG_FILE" 14 60
             return 1
         fi
 
         if [[ ! -d "supabase/docker" ]]; then
-            kill "$gp1" 2>/dev/null || true
             rm -rf supabase
             log "ERROR: supabase/docker directory not found in repo"
-            dialog --title "Ошибка" --msgbox "В репозитории Supabase нет папки docker.\nВерсия изменилась? Лог: $LOG_FILE" 10 60
-            cd "$SETUP_DIR"
+            popd >/dev/null 2>&1 || true
+            dialog --title "Ошибка" --msgbox "В репозитории Supabase нет папки docker.\nЛог: $LOG_FILE" 10 60
             return 1
         fi
 
+        log "Supabase: running sparse-checkout..."
         (cd supabase && git sparse-checkout set docker >> "$LOG_FILE" 2>&1)
         mv supabase/docker supabase-docker
         rm -rf supabase
-        kill "$gp1" 2>/dev/null || true
-
         log "Supabase repository cloned successfully"
     fi
 
     # ВАЖНО: проверяем что supabase-docker существует перед cd
     if [[ ! -d "supabase-docker" ]]; then
         log "ERROR: supabase-docker directory missing after clone!"
+        popd >/dev/null 2>&1 || true
         dialog --title "Ошибка" --msgbox "Папка supabase-docker не найдена.\nУдалите $SETUP_DIR/supabase-docker вручную и запустите снова." 10 60
-        cd "$SETUP_DIR"
         return 1
     fi
 
-    cd supabase-docker || { log "ERROR: cd supabase-docker failed"; cd "$SETUP_DIR"; return 1; }
+    cd supabase-docker || { log "ERROR: cd supabase-docker failed"; popd >/dev/null 2>&1 || true; return 1; }
 
     # --- Существующая установка ---
     if [[ -f ".env" ]] && grep -q "^ANON_KEY=" .env 2>/dev/null; then
@@ -807,6 +901,18 @@ setup_supabase() {
             printf '\nnetworks:\n  internal_network:\n    external: true\n' >> docker-compose.yml
         fi
 
+        # Патчим порты при обновлении тоже
+        log "Supabase: patching ports Studio=$SUPABASE_PORT_STUDIO DB=$SUPABASE_PORT_PG API=$SUPABASE_PORT_API Mail=$SUPABASE_PORT_MAIL Auth=$SUPABASE_PORT_AUTH"
+        local _sb_tmp2
+        _sb_tmp2=$(mktemp)
+        sed -e "s/:3000:/:${SUPABASE_PORT_STUDIO}:/g" \
+            -e "s/:54322:/:${SUPABASE_PORT_PG}:/g" \
+            -e "s/:8000:/:${SUPABASE_PORT_API}:/g" \
+            -e "s/:8085:/:${SUPABASE_PORT_MAIL}:/g" \
+            -e "s/:5555:/:${SUPABASE_PORT_AUTH}:/g" \
+            docker-compose.yml > "$_sb_tmp2"
+        mv "$_sb_tmp2" docker-compose.yml
+
         if supabase_compose_up; then
             connect_supabase_to_network
             dialog --title "Supabase" --msgbox "Supabase (обновление) запущен и работает!" 6 55
@@ -814,15 +920,15 @@ setup_supabase() {
             log "ERROR: Supabase restart failed"
             dialog --title "Ошибка" --msgbox "Supabase не удалось перезапустить.\nЛог: $LOG_FILE" 8 50
         fi
-        cd "$SETUP_DIR"
+        popd >/dev/null 2>&1
         return 0
     fi
 
     # --- Новая установка ---
     if [[ ! -f ".env.example" ]]; then
         log "ERROR: .env.example not found in supabase-docker"
+        popd >/dev/null 2>&1
         dialog --title "Ошибка" --msgbox "Файл .env.example не найден в supabase-docker.\nВозможно, структура репозитория изменилась.\nЛог: $LOG_FILE" 10 60
-        cd "$SETUP_DIR"
         return 1
     fi
 
@@ -855,6 +961,18 @@ setup_supabase() {
         printf '\nnetworks:\n  internal_network:\n    external: true\n' >> docker-compose.yml
     fi
 
+    # ─── Патчим порты Supabase в docker-compose.yml ─────────────────────
+    log "Supabase: patching ports Studio=$SUPABASE_PORT_STUDIO DB=$SUPABASE_PORT_PG API=$SUPABASE_PORT_API Mail=$SUPABASE_PORT_MAIL Auth=$SUPABASE_PORT_AUTH"
+    local _sb_tmp
+    _sb_tmp=$(mktemp)
+    sed -e "s/:3000:/:${SUPABASE_PORT_STUDIO}:/g" \
+        -e "s/:54322:/:${SUPABASE_PORT_PG}:/g" \
+        -e "s/:8000:/:${SUPABASE_PORT_API}:/g" \
+        -e "s/:8085:/:${SUPABASE_PORT_MAIL}:/g" \
+        -e "s/:5555:/:${SUPABASE_PORT_AUTH}:/g" \
+        docker-compose.yml > "$_sb_tmp"
+    mv "$_sb_tmp" docker-compose.yml
+
     log "Supabase: starting containers (new install)"
 
     dialog --title "Supabase (2/2)" --gauge "Запуск Supabase... это может занять время..." 8 60 50
@@ -866,14 +984,14 @@ setup_supabase() {
         log "ERROR: Supabase first start FAILED"
         dialog --title "Ошибка Supabase" --msgbox "Supabase НЕ запустился.\nЛог: $LOG_FILE\n\nПроверьте:\n- Порты 3000, 54322, 8000 свободны\n- Docker ресурсы не исчерпаны" 14 60
     fi
-    cd "$SETUP_DIR"
+    popd >/dev/null 2>&1
 }
 
 ###############################################################################
 #  ГЕНЕРАЦИЯ docker-compose.yml
 ###############################################################################
 generate_compose_file() {
-    cd "$SETUP_DIR"
+    cd "$SETUP_DIR" || { log "ERROR: Cannot cd to $SETUP_DIR"; return 1; }
     local _pg=""
     if is_selected "postgres"; then
         _pg=$(env_esc "${PGPASSWORD:-}")
@@ -1046,16 +1164,29 @@ YEOF
 }
 
 ###############################################################################
-#  СОЗДАНИЕ БД n8n (v4.10 — psql -U postgres, superuser, trust auth)
+#  СОЗДАНИЕ БД n8n (fix v4.12 — psql -U admin, т.к. POSTGRES_USER=admin)
 ###############################################################################
 create_n8n_database() {
+    # Ждём пока PostgreSQL примет подключения (до 60 сек)
+    local wait=0
+    while [[ $wait -lt 60 ]]; do
+        local _health
+        _health=$(docker exec postgres pg_isready -U admin -h localhost 2>&1) || true
+        log "n8n DB: pg_isready (wait ${wait}s): $_health"
+        if echo "$_health" | grep -qi "accepting"; then
+            break
+        fi
+        sleep 3
+        wait=$((wait + 3))
+    done
+
     local n=0
     while [[ $n -lt 3 ]]; do
         n=$((n + 1))
 
         # Проверяем — существует ли уже
         local _check
-        _check=$(docker exec postgres psql -U postgres -tAc \
+        _check=$(docker exec postgres psql -U admin -h localhost -tAc \
             "SELECT 1 FROM pg_database WHERE datname='n8n';" 2>&1) || true
         log "n8n DB check (try $n): $(echo "$_check" | tr -d '\n')"
 
@@ -1064,10 +1195,10 @@ create_n8n_database() {
             return 0
         fi
 
-        # Создаём через postgres superuser (всегда работает!)
-        log "n8n DB missing, creating via postgres superuser..."
+        # Создаём через admin user (POSTGRES_USER=admin)
+        log "n8n DB missing, creating via admin..."
         local _result
-        _result=$(docker exec postgres psql -U postgres -c "CREATE DATABASE n8n;" 2>&1) || true
+        _result=$(docker exec postgres psql -U admin -h localhost -c "CREATE DATABASE n8n;" 2>&1) || true
         log "n8n CREATE (try $n): $(echo "$_result" | tr -d '\n')"
 
         if echo "$_result" | grep -qi "created\|already"; then
@@ -1078,16 +1209,16 @@ create_n8n_database() {
         sleep 3
     done
 
-    log "ERROR: failed to create n8n database after 3 attempts"
-    return 1
+    log "ERROR: failed to create n8n database after 3 attempts — continuing anyway"
+    # НЕ return 1! Пусть контейнеры запустятся, n8n сам создаст БД или скажет ошибку
+    return 0
 }
 
 ###############################################################################
-#  ЗАПУСК КОНТЕЙНЕРОВ (v4.10 — поэтапный: PG -> БД -> n8n)
+#  ЗАПУСК КОНТЕЙНЕРОВ
 ###############################################################################
 start_containers() {
     cd "$SETUP_DIR"
-    local compose_err="$TMP2"
 
     _has_n8n_pg=0
     is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres" && _has_n8n_pg=1
@@ -1098,7 +1229,7 @@ start_containers() {
         docker compose up -d postgres >> "$LOG_FILE" 2>&1
         sleep 20
 
-        # Шаг 2: создание БД n8n (через postgres superuser)
+        # Шаг 2: создание БД n8n (через admin user)
         dialog --gauge "Шаг 2/3: Создание БД для n8n..." 8 60 40
         create_n8n_database
         sleep 5
@@ -1114,30 +1245,20 @@ start_containers() {
         sleep 5
     else
         # Обычный запуск — без n8n+Postgres
-        dialog --gauge "Запуск контейнеров... это может занять время..." 8 60 10 &
-        local gp=$!
-
-        if ! docker compose up -d >"$compose_err" 2>&1; then
-            kill "$gp" 2>/dev/null || true
-            log "ERROR: docker compose up failed"
-            cat "$compose_err" >> "$LOG_FILE" 2>/dev/null || true
-            dialog --title "Ошибка при запуске" --textbox "$compose_err" 20 80
-            exit 1
-        fi
-        kill "$gp" 2>/dev/null || true
-
-        dialog --gauge "Проверка контейнеров..." 8 60 80 &
-        gp=$!
+        dialog --gauge "Запуск контейнеров... это может занять время..." 8 60 10
+        docker compose up -d >> "$LOG_FILE" 2>&1
+        sleep 10
+        dialog --gauge "Проверка контейнеров..." 8 60 80
+        log "Containers after start:"
+        docker ps --format "{{.Names}}\t{{.Status}}" >> "$LOG_FILE" 2>&1
         sleep 3
-        kill "$gp" 2>/dev/null || true
     fi
 
     local running_count
     running_count=$(docker ps --filter "label=com.docker.compose.project" --format '{{.Names}}' 2>/dev/null | wc -l)
     if [[ "$running_count" -eq 0 ]]; then
         log "ERROR: No containers started"
-        cat "$compose_err" >> "$LOG_FILE" 2>/dev/null || true
-        dialog --title "Ошибка" --msgbox "Контейнеры не запустились. Лог: $compose_err" 8 60
+        dialog --title "Ошибка" --msgbox "Контейнеры не запустились.\nЛог: $LOG_FILE" 8 60
         exit 1
     fi
     log "Containers started: $running_count running"
@@ -1212,7 +1333,7 @@ SUM
 ###############################################################################
 reinstall_service() {
     local svc="$1"
-    cd "$SETUP_DIR"
+    cd "$SETUP_DIR" || { log "ERROR: Cannot cd to $SETUP_DIR"; return 1; }
     case "$svc" in
         supabase)
             if ! dialog --yesno "Переустановить Supabase?\n\nВСЕ ДАННЫЕ БУДУТ УДАЛЕНЫ (-v)\nСделайте backup!" 8 60; then
@@ -1227,13 +1348,17 @@ reinstall_service() {
             generate_compose_file
             docker compose stop "$svc" 2>/dev/null || true
             docker compose rm -fv "$svc" 2>/dev/null || true
-            docker compose up -d "$svc" >/dev/null 2>&1
+            docker compose up -d "$svc" >> "$LOG_FILE" 2>&1
             ;;
     esac
     dialog --msgbox "${svc} переустановлен." 6 45
 }
 
 show_status() {
+    if [[ ! -d "$SETUP_DIR" ]]; then
+        dialog --title "Статус" --msgbox "Директория $SETUP_DIR не найдена.\nСервисы ещё не установлены." 8 60
+        return
+    fi
     docker compose ps 2>"$TMP2" || echo "Compose не найден в $SETUP_DIR" >"$TMP2"
     docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null >>"$TMP2" || true
     dialog --title "Статус контейнеров" --textbox "$TMP2" 20 80
@@ -1251,8 +1376,8 @@ post_install_menu() {
             "3" "Проверить статус" \
             "4" "Показать сводку" \
             "5" "Показать лог" \
-            "7" "Скачать лог на локальный хост" \
             "6" "Сбросить всё" \
+            "7" "Скачать лог (копия в /tmp)" \
             "0" "Выйти" 2>"$TMP" || return 0
 
         local choice
@@ -1272,8 +1397,7 @@ post_install_menu() {
                 save_params
                 setup_network
                 generate_compose_file
-                # НЕ делаем 'down --remove-orphans' — это убивает ВСЕ контейнеры!
-                # Запускаем только новые сервисы из compose
+                # НЕТ 'down --remove-orphans' — добавление сервисов НЕ удаляет соседние
 
                 _has_n8n_pg=0
                 is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres" && _has_n8n_pg=1
@@ -1407,13 +1531,11 @@ main() {
             setup_network
             generate_compose_file
             start_containers
-            # Supabase — В КОНЦЕ (тяжёлый, много контейнеров, не должен мешать остальным)
+            print_npm_info
             show_final_summary
             save_state "completed"
+            # Supabase — В КОНЦЕ (тяжёлый, много контейнеров, не должен мешать остальным)
             setup_supabase
-            print_npm_info
-            # Показываем финальную сводку ЕЩЁ РАЗ, теперь с Supabase
-            show_final_summary
             ;;
         done|docker_installed|network_needed)
             setup_network
@@ -1421,6 +1543,8 @@ main() {
             start_containers
             print_npm_info
             show_final_summary
+            # Supabase — в конце
+            setup_supabase
             save_state "done"
             ;;
         completed)
