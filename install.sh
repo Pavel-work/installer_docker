@@ -1025,6 +1025,20 @@ setup_supabase() {
 ###############################################################################
 generate_compose_file() {
     cd "$SETUP_DIR" || { log "ERROR: Cannot cd to $SETUP_DIR"; return 1; }
+
+    # Проверяем есть ли хоть один compose-сервис
+    local _has_compose_svc=0
+    for s in postgres qdrant ollama nginx_proxy portainer n8n apache; do
+        is_selected "$s" && _has_compose_svc=1 && break
+    done
+
+    # Если выбран ТОЛЬКО supabase → пропускаем генерацию docker-compose
+    # Supabase работает через свой собственный compose файл
+    if [[ $_has_compose_svc -eq 0 ]]; then
+        log "No compose services selected — skipping docker-compose generation (supabase only)"
+        return 0
+    fi
+
     local _pg=""
     if is_selected "postgres"; then
         _pg=$(env_esc "${PGPASSWORD:-}")
@@ -1046,7 +1060,6 @@ generate_compose_file() {
         fi
         is_selected "portainer" && echo '  portainer_data:'
         is_selected "n8n"       && echo '  n8n_data:'
-        [ -z "$(echo "postgres qdrant ollama nginx_proxy portainer n8n" | tr ' ' '\n' | while read s; do is_selected "$s" && echo "$s"; done)" ] && echo '{}'
         echo 'services:'
     } >docker-compose.yml
 
@@ -1228,8 +1241,8 @@ create_n8n_database() {
 
         # Пробуем 2 способа подключения: docker exec + docker compose exec
         local _check _check2 _rc1=1 _rc2=1
-        _check=$(docker exec postgres psql -U admin -c "SELECT 1 FROM pg_database WHERE datname='n8n';" -tA 2>&1) || _rc1=$?
-        _check2=$(cd "$SETUP_DIR" && docker compose exec postgres psql -U admin -c "SELECT 1 FROM pg_database WHERE datname='n8n';" -tA 2>&1) || _rc2=$?
+        _check=$(docker exec postgres psql -U admin -d appdb -c "SELECT 1 FROM pg_database WHERE datname='n8n';" -tA 2>&1) || _rc1=$?
+        _check2=$(cd "$SETUP_DIR" && docker compose exec postgres psql -U admin -d appdb -c "SELECT 1 FROM pg_database WHERE datname='n8n';" -tA 2>&1) || _rc2=$?
         log "n8n DB check (try $n): _check=$_check (rc=$_rc1), _check2=$_check2 (rc=$_rc2)"
 
         local _final_check="$_check"
@@ -1245,8 +1258,8 @@ create_n8n_database() {
         # Создаём через admin user
         log "n8n DB missing, creating via admin..."
         local _result _result2 _rc_c1=1 _rc_c2=1
-        _result=$(docker exec postgres psql -U admin -c "CREATE DATABASE n8n;" 2>&1) || _rc_c1=$?
-        _result2=$(cd "$SETUP_DIR" && docker compose exec postgres psql -U admin -c "CREATE DATABASE n8n;" 2>&1) || _rc_c2=$?
+        _result=$(docker exec postgres psql -U admin -d appdb -c "CREATE DATABASE n8n;" 2>&1) || _rc_c1=$?
+        _result2=$(cd "$SETUP_DIR" && docker compose exec postgres psql -U admin -d appdb -c "CREATE DATABASE n8n;" 2>&1) || _rc_c2=$?
         log "n8n CREATE (try $n): _result=$_result (rc=$_rc_c1), _result2=$_result2 (rc=$_rc_c2)"
 
         if echo "$_result" | grep -qi "created\|already" || echo "$_result2" | grep -qi "created\|already"; then
@@ -1266,7 +1279,7 @@ create_n8n_database() {
     # Fallback: пробуем через psql на хосте если установлен
     if command -v psql &>/dev/null && [[ -n "$PGPASSWORD" ]]; then
         log "n8n DB: fallback via host psql..."
-        PGPASSWORD="$PGPASSWORD" psql -U admin -h 127.0.0.1 -p 5432 -c "CREATE DATABASE n8n;" 2>&1 | tee -a "$LOG_FILE"
+        PGPASSWORD="$PGPASSWORD" psql -U admin -h 127.0.0.1 -p 5432 -d appdb -c "CREATE DATABASE n8n;" 2>&1 | tee -a "$LOG_FILE"
     fi
 
     log "ERROR: failed to create n8n database after 3 attempts — continuing anyway, n8n will try itself"
@@ -1278,7 +1291,13 @@ create_n8n_database() {
 #  ЗАПУСК КОНТЕЙНЕРОВ
 ###############################################################################
 start_containers() {
-    cd "$SETUP_DIR"
+    cd "$SETUP_DIR" || { log "ERROR: Cannot cd to $SETUP_DIR"; return 1; }
+
+    # Проверяем есть ли docker-compose.yml
+    if [[ ! -f "docker-compose.yml" ]]; then
+        log "No docker-compose.yml — skipping container start (supabase only mode)"
+        return 0
+    fi
 
     _has_n8n_pg=0
     is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres" && _has_n8n_pg=1
