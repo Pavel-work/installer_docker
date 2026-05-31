@@ -866,7 +866,7 @@ setup_supabase() {
     pushd "$SETUP_DIR" >/dev/null || { log "ERROR: Cannot pushd to $SETUP_DIR"; return 1; }
 
     if [[ ! -d "supabase-docker" ]]; then
-        dialog --title "Supabase (1/2)" --gauge "Скачивание supabase/docker..." 8 60 20
+        dialog --title "Supabase (1/2)" --gauge "Скачивание supabase/docker..." 8 60 20 &
         log "Supabase: downloading docker folder from GitHub..."
 
         local _dl_ok=0
