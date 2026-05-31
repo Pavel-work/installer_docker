@@ -986,6 +986,21 @@ setup_supabase() {
 
     cd supabase-docker || { log "ERROR: cd supabase-docker failed"; popd >/dev/null 2>&1 || true; return 1; }
 
+    # --- Фикс realtime health check ---
+    # В dev-mode realtime /api/tenants/*/health возвращает 403
+    # Переопределяем healthcheck чтобы проверять просто доступность порта 4000
+    cat > docker-compose.override.yml << 'OVERRIDE_EOF'
+services:
+  realtime:
+    healthcheck:
+      test: "curl -sSfL --head -o /dev/null http://localhost:4000/ || exit 1"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+OVERRIDE_EOF
+    log "Supabase: realtime healthcheck override created"
+
     # --- Существующая установка ---
     if [[ -f ".env" ]] && grep -q "^ANON_KEY=" .env 2>/dev/null; then
         log "Supabase already installed, preserving keys"
