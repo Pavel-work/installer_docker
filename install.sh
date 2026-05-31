@@ -2,7 +2,7 @@
 set -uo pipefail
 
 ###############################################################################
-#  Джентльменский набор - установщик сервисов v4.12
+#  Джентльменский набор - установщик сервисов v4.14
 ###############################################################################
 #  Изменения v4.12:
 #    • Фикс psql: -U postgres → -U admin -h localhost (POSTGRES_USER=admin!)
@@ -1200,50 +1200,77 @@ YEOF
 #  СОЗДАНИЕ БД n8n (fix v4.12 — psql -U admin, т.к. POSTGRES_USER=admin)
 ###############################################################################
 create_n8n_database() {
-    # Ждём пока PostgreSQL примет подключения (до 60 сек)
+    # Ждём пока PostgreSQL примет подключения (до 90 сек)
     local wait=0
-    while [[ $wait -lt 60 ]]; do
-        local _health
-        _health=$(docker exec postgres pg_isready -U admin -h localhost 2>&1) || true
-        log "n8n DB: pg_isready (wait ${wait}s): $_health"
-        if echo "$_health" | grep -qi "accepting"; then
+    log "n8n DB: waiting for PostgreSQL to be ready..."
+    while [[ $wait -lt 90 ]]; do
+        # Пробуем через docker compose exec (работает через сеть Docker) И через docker exec
+        local _health1 _health2
+        _health1=$(docker exec postgres pg_isready -U admin 2>&1) || true
+        _health2=$(docker exec postgres pg_isready -U admin -h localhost 2>&1) || true
+        if echo "$_health1" | grep -qi "accepting" || echo "$_health2" | grep -qi "accepting"; then
+            log "n8n DB: PostgreSQL accepting connections (wait ${wait}s): $_health1"
             break
         fi
         sleep 3
         wait=$((wait + 3))
     done
 
+    # Проверяем что docker exec вообще работает
+    log "n8n DB: testing docker exec postgres psql --version..."
+    local _psql_ver
+    _psql_ver=$(docker exec postgres psql --version 2>&1) || true
+    log "n8n DB: psql version inside container: $_psql_ver"
+
     local n=0
     while [[ $n -lt 3 ]]; do
         n=$((n + 1))
 
-        # Проверяем — существует ли уже
-        local _check
-        _check=$(docker exec postgres psql -U admin -h localhost -tAc \
-            "SELECT 1 FROM pg_database WHERE datname='n8n';" 2>&1) || true
-        log "n8n DB check (try $n): $(echo "$_check" | tr -d '\n')"
+        # Пробуем 2 способа подключения: docker exec + docker compose exec
+        local _check _check2 _rc1=1 _rc2=1
+        _check=$(docker exec postgres psql -U admin -c "SELECT 1 FROM pg_database WHERE datname='n8n';" -tA 2>&1) || _rc1=$?
+        _check2=$(cd "$SETUP_DIR" && docker compose exec postgres psql -U admin -c "SELECT 1 FROM pg_database WHERE datname='n8n';" -tA 2>&1) || _rc2=$?
+        log "n8n DB check (try $n): _check=$_check (rc=$_rc1), _check2=$_check2 (rc=$_rc2)"
 
-        if [[ "$(echo "$_check" | tr -d '[:space:]')" == "1" ]]; then
+        local _final_check="$_check"
+        if [[ -z "$(echo "$_check" | tr -d '[:space:]')" ]] && [[ -n "$(echo "$_check2" | tr -d '[:space:]')" ]]; then
+            _final_check="$_check2"
+        fi
+
+        if [[ "$(echo "$_final_check" | tr -d '[:space:]')" == "1" ]]; then
             log "n8n database EXISTS"
             return 0
         fi
 
-        # Создаём через admin user (POSTGRES_USER=admin)
+        # Создаём через admin user
         log "n8n DB missing, creating via admin..."
-        local _result
-        _result=$(docker exec postgres psql -U admin -h localhost -c "CREATE DATABASE n8n;" 2>&1) || true
-        log "n8n CREATE (try $n): $(echo "$_result" | tr -d '\n')"
+        local _result _result2 _rc_c1=1 _rc_c2=1
+        _result=$(docker exec postgres psql -U admin -c "CREATE DATABASE n8n;" 2>&1) || _rc_c1=$?
+        _result2=$(cd "$SETUP_DIR" && docker compose exec postgres psql -U admin -c "CREATE DATABASE n8n;" 2>&1) || _rc_c2=$?
+        log "n8n CREATE (try $n): _result=$_result (rc=$_rc_c1), _result2=$_result2 (rc=$_rc_c2)"
 
-        if echo "$_result" | grep -qi "created\|already"; then
+        if echo "$_result" | grep -qi "created\|already" || echo "$_result2" | grep -qi "created\|already"; then
             log "n8n database CREATED"
             return 0
         fi
 
-        sleep 3
+        # Также проверяем через exit code — если 0 и вывод пустой, это успех CREATE DATABASE
+        if [[ $_rc_c1 -eq 0 ]] || [[ $_rc_c2 -eq 0 ]]; then
+            log "n8n database CREATED (exit code 0)"
+            return 0
+        fi
+
+        sleep 5
     done
 
-    log "ERROR: failed to create n8n database after 3 attempts — continuing anyway"
-    # НЕ return 1! Пусть контейнеры запустятся, n8n сам создаст БД или скажет ошибку
+    # Fallback: пробуем через psql на хосте если установлен
+    if command -v psql &>/dev/null && [[ -n "$PGPASSWORD" ]]; then
+        log "n8n DB: fallback via host psql..."
+        PGPASSWORD="$PGPASSWORD" psql -U admin -h 127.0.0.1 -p 5432 -c "CREATE DATABASE n8n;" 2>&1 | tee -a "$LOG_FILE"
+    fi
+
+    log "ERROR: failed to create n8n database after 3 attempts — continuing anyway, n8n will try itself"
+    # НЕ return 1!
     return 0
 }
 
