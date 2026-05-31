@@ -2,8 +2,20 @@
 set -uo pipefail
 
 ###############################################################################
-#  Универсальный установщик сервисов v4.2
+#  Джентльменский набор - установщик сервисов v4.4
 ###############################################################################
+#  Изменения v4.4:
+#    • Увеличены паузы между запусками контейнеров (30с POSTGRES, 20с финал)
+#    • Корректный поэтапный запуск: postgres -> БД -> остальные
+#    • Убраны дубликаты docker compose up -d
+#    • Удалено копирование лога в файл, добавлено меню с копированием
+#    • Исправлены CRLF → LF
+#
+#  Изменения v4.3:
+#    • Исправлено: порядок запуска — сначала postgres, потом создание БД n8n
+#    • Исправлено: копирование лога через кнопку в диалоговом меню
+#    • Исправлено: n8n с Postgres запускается корректно (DB создаётся ДО старта n8n)
+#
 #  Изменения v4.2:
 #    • Исправлено: n8n подключение к БД через post-install (CREATE DB + restart)
 #    • Удалено: копирование лога в файл (текст выделяется мышкой в textbox)
@@ -540,7 +552,7 @@ show_welcome() {
     if dialog --title "Добро пожаловать!" \
         --yes-label "Начать " --no-label "Выйти " \
         --yesno "
-Универсальный установщик сервисов v4.0
+Джентльменский набор - установщик сервисов
 
 Это приложение автоматизирует установку серверных сервисов:
 
@@ -565,7 +577,7 @@ show_welcome() {
   - root или sudo
   - Интернет-соединение
 
-Внимание: установка займёт от 5 до 30 минут.
+Внимание: установка займёт от 2 до 30 минут.
 " 34 85; then
         log "Welcome screen displayed"
     else
@@ -1251,7 +1263,7 @@ post_install_menu() {
             1)
                 show_service_menu
                 if [[ ${#SELECTED_ARRAY[@]} -eq 0 ]]; then
-                    echo "Отмена." | dialog --msgbox "Ничего не выбрано." 6 50
+                    dialog --msgbox "Ничего не выбрано." 6 50
                     _nav_action="next"
                     continue
                 fi
@@ -1264,18 +1276,47 @@ post_install_menu() {
                 setup_supabase
                 generate_compose_file
                 docker compose down --remove-orphans >/dev/null 2>&1 || true
-                docker compose up -d >/dev/null 2>&1
 
-                # Если n8n с Postgres — ждём БД и создаём
-                if is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" -eq 1 ]] && is_selected "postgres"; then
-                    dialog --gauge "Настройка базы данных n8n..." 6 50 0 &
-                    local _db_gp=$!
-                    sleep 10
-                    kill "$_db_gp" 2>/dev/null || true
-                    docker exec -e PGPASSWORD="${PGPASSWORD}" postgres \
-                        psql -U admin -c "CREATE DATABASE n8n;" >/dev/null 2>&1 || true
-                    log "n8n database created"
-                    docker restart n8n >/dev/null 2>&1
+                # Порядок запуска: сначала postgres, БД для n8n, остальные
+                _has_n8n_pg=0
+                if is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres"; then
+                    _has_n8n_pg=1
+                fi
+
+                if [[ $_has_n8n_pg -eq 1 ]]; then
+                    # Шаг 1: запускаем только PostgreSQL
+                    dialog --gauge "Шаг 1/3: Запуск PostgreSQL..." 6 50 10 &
+                    local _g1=$!
+                    docker compose up -d postgres >/dev/null 2>&1
+                    kill "$_g1" 2>/dev/null || true
+
+                    # Ожидание полной готовности PostgreSQL (30 сек)
+                    dialog --gauge "Шаг 1/3: Ожидание готовности PostgreSQL (30с)..." 6 50 25 &
+                    local _g1w=$!
+                    sleep 30
+                    kill "$_g1w" 2>/dev/null || true
+
+                    # Шаг 2: создаём БД для n8n
+                    dialog --gauge "Шаг 2/3: Создание БД для n8n..." 6 50 40 &
+                    local _g2=$!
+                    docker exec -e PGPASSWORD="${PGPASSWORD}" postgres \n                        psql -U admin -c "CREATE DATABASE n8n;" >/dev/null 2>&1 || true
+                    log "n8n database created (pre-start)"
+                    kill "$_g2" 2>/dev/null || true
+                    sleep 3
+
+                    # Шаг 3: запускаем все остальные контейнеры
+                    dialog --gauge "Шаг 3/3: Запуск всех контейнеров..." 6 50 70 &
+                    local _g3=$!
+                    docker compose up -d >/dev/null 2>&1
+                    kill "$_g3" 2>/dev/null || true
+
+                    # Пауза для полного старта всех сервисов (20 сек)
+                    dialog --gauge "Ожидание запуска сервисов (20с)..." 6 50 85 &
+                    local _g3w=$!
+                    sleep 20
+                    kill "$_g3w" 2>/dev/null || true
+                else
+                    docker compose up -d >/dev/null 2>&1
                 fi
                 show_final_summary
                 ;;
@@ -1305,13 +1346,24 @@ post_install_menu() {
                 show_final_summary
                 ;;
             5)
-                if [[ -f "$LOG_FILE" ]]; then
-                    while true; do
-                        dialog --title "Лог установки" --textbox "$LOG_FILE" 36 100 2>/dev/null || break
-                    done
-                else
-                    dialog --msgbox "Лог недоступен: $LOG_FILE" 8 60
-                fi
+                _show_log=1
+                while [[ $_show_log -eq 1 ]]; do
+                    dialog --title "Журнал установки" --menu \
+                        "Выберите действие:" 12 55 3 \
+                        "1" "Просмотреть лог" \
+                        "2" "Скопировать в ~/install_log.txt" \
+                        "0" "Назад" 2>"$TMP" || break
+
+                    case "$(<"$TMP")" in
+                        1) dialog --title "Лог установки" --textbox "$LOG_FILE" 32 95 2>/dev/null ;;
+                        2)
+                            cp "$LOG_FILE" "$HOME/install_log.txt" 2>/dev/null \
+                                && dialog --msgbox "Лог скопирован в:\n\n$HOME/install_log.txt" 8 60 \
+                                || dialog --msgbox "Ошибка копирования!" 6 50
+                            ;;
+                        0) _show_log=0 ;;
+                    esac
+                done
                 ;;
             6)
                 if ! dialog --yesno "Сбросить ВСЁ?\n\nБудут удалены:\n  - ${STATE_DIR}\n  - compose down -v\n  - данные Supabase" 10 60; then
