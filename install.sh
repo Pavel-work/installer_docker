@@ -805,11 +805,28 @@ verify_supabase() {
     return 1
 }
 
+supabase_compose_pull_retry() {
+    # Pull все образы с retry — критично при нестабильном соединении
+    local max_pull=3 p=0
+    while [[ $p -lt $max_pull ]]; do
+        p=$((p + 1))
+        log "Supabase: compose pull attempt $p/$max_pull..."
+        if timeout 600 docker compose -p supabase pull >> "$LOG_FILE" 2>&1; then
+            log "Supabase: all images pulled successfully"
+            return 0
+        fi
+        log "WARNING: Supabase pull attempt $p failed, retrying in 15s..."
+        sleep 15
+    done
+    log "ERROR: Supabase pull failed after $max_pull attempts"
+    return 1
+}
+
 supabase_compose_up() {
-    local max_attempts=2 attempt=0
+    local max_attempts=3 attempt=0
     while [[ $attempt -lt $max_attempts ]]; do
         attempt=$((attempt + 1))
-        log "Supabase compose up attempt $attempt..."
+        log "Supabase compose up attempt $attempt/$max_attempts..."
         if docker compose -p supabase up -d >> "$LOG_FILE" 2>&1; then
             log "Supabase compose up (attempt $attempt) succeeded"
             sleep 15
@@ -820,8 +837,12 @@ supabase_compose_up() {
             docker compose -p supabase down 2>&1 | tee -a "$LOG_FILE"
         else
             log "ERROR: Supabase compose up attempt $attempt FAILED"
+            if [[ $attempt -lt $max_attempts ]]; then
+                log "Retrying image pull before next attempt..."
+                supabase_compose_pull_retry || true
+            fi
         fi
-        sleep 5
+        sleep 10
     done
     return 1
 }
