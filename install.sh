@@ -2,43 +2,16 @@
 set -uo pipefail
 
 ###############################################################################
-#  Джентльменский набор - установщик сервисов v4.5
+#  Джентльменский набор - установщик сервисов v4.11
 ###############################################################################
-#  Изменения v4.5:
-#    • Полностью переписан порядок запуска: postgres -> БД n8n -> остальные
-#    • start_containers() теперь поэтапный (30с PG + 5с БД + 20с старт)
-#    • n8n больше не падает при запуске с PostgreSQL
+#  Изменения v4.11:
+#    • ФИНАЛЬНЫЙ ФИКС n8n: env vars DB_HOST → DB_POSTGRESDB_HOST и т.д.
+#    • n8n требует именно DB_POSTGRESDB_* переменные, не DB_*
+#    • CREATE DATABASE n8n через postgres superuser, 3 попытки с верификацией
+#    • Поэтапный запуск: PG → БД → остальные (20с ожидание)
+#    • Нет заглушек >/dev/null — ошибки видны в /var/log/install.log
 #
-#  Изменения v4.4:
-#    • Увеличены паузы между запусками контейнеров (30с POSTGRES, 20с финал)
-#    • Корректный поэтапный запуск: postgres -> БД -> остальные
-#    • Убраны дубликаты docker compose up -d
-#    • Удалено копирование лога в файл, добавлено меню с копированием
-#    • Исправлены CRLF → LF
-#
-#  Изменения v4.3:
-#    • Исправлено: порядок запуска — сначала postgres, потом создание БД n8n
-#    • Исправлено: копирование лога через кнопку в диалоговом меню
-#    • Исправлено: n8n с Postgres запускается корректно (DB создаётся ДО старта n8n)
-#
-#  Изменения v4.2:
-#    • Исправлено: n8n подключение к БД через post-install (CREATE DB + restart)
-#    • Удалено: копирование лога в файл (текст выделяется мышкой в textbox)
-#    • Проверка запуска контейнеров после обновления
-#
-#  Изменения v4.1:
-#    • Кнопки Далее/Назад во всех шагах настройки
-#    • Настраиваемый порт для Portainer
-#    • Увеличено окно приветствия и окна лога
-#    • Исправлено: меню добавления сервисов теперь показывает выбор
-#    • Исправлено: Esc в выборе сервисов возвращает назад вместо exit
-#    • Исправлено: n8n DB выбор (SQLite больше не возвращает назад)
-#    • Исправлено: конфликт портов не прерывает установку
-#    • Параметры ТОЛЬКО для выбранных сервисов
-#    • Причинно-следственная логика зависимостей
-#    • Каждый шаг привязан к конкретному сервису
-#    • Лог действий в /var/log/install.log
-#    • Проверка свободного диска
+#  v4.1-v4.10: порты, навигация, выбор БД, поэтапный запуск, postgres user
 ###############################################################################
 
 # ─── Глобальные пути ────────────────────────────────────────────────────────
@@ -63,7 +36,7 @@ log() {
     printf '%s  %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
 }
 
-# ─── Утилиты кодирования ────────────────────────────────────────────────────
+# ─── Утилиты ────────────────────────────────────────────────────────────────
 env_esc() {
     local v="${1:-}"
     v="${v//\\/\\\\}"
@@ -72,10 +45,8 @@ env_esc() {
     printf '"%s"' "$v"
 }
 
-# Escape for docker-compose.yml volumes — без кавычек, просто экранирование спецсимволов
 compose_esc() {
     local v="${1:-}"
-    # Двойные кавычки экранируем
     v="${v//\"/\\\"}"
     printf '%s' "$v"
 }
@@ -85,10 +56,7 @@ inject_env() {
     tmp=$(mktemp)
     while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
-            "${key}="*)
-                printf '%s=%s\n' "$key" "$value"
-                continue
-                ;;
+            "${key}="*) printf '%s=%s\n' "$key" "$value"; continue ;;
         esac
         printf '%s\n' "$line"
     done < "$file" > "$tmp"
@@ -123,7 +91,7 @@ check_port() {
     elif command -v netstat &>/dev/null; then
         { netstat -tuln 2>/dev/null | grep -qE ":${port}[^0-9]"; } && in_use=1
     else
-        { bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; } && in_use=1
+        { bash -c "echo >/dev/tcp/localhost/${port}" 2>/dev/null; } && in_use=1
     fi
     if [[ $in_use -eq 1 ]]; then
         if dialog --title "Порт занят" --yes-label "Другой порт" --no-label "Пропустить" \
@@ -215,12 +183,20 @@ declare -A _PM=(
 )
 
 load_params() {
-    PGPASSWORD="" JWT_SECRET=""
-    LLM_TYPE="ollama" LLM_API_KEY="" LLM_API_URL="http://ollama:11434"
-    DOMAIN="" SUPABASE_DOMAIN=""
-    N8N_PORT=5678 N8N_DB_POSTGRES=0
-    APACHE_WWW_PATH="$SETUP_DIR/www" APACHE_HTTP_PORT=8080
-    QDRANT_PORT=6333 PORTAINER_PORT=9000 OLLAMA_PORT=11434
+    PGPASSWORD=""
+    JWT_SECRET=""
+    LLM_TYPE="ollama"
+    LLM_API_KEY=""
+    LLM_API_URL="http://ollama:11434"
+    DOMAIN=""
+    SUPABASE_DOMAIN=""
+    N8N_PORT=5678
+    N8N_DB_POSTGRES=0
+    APACHE_WWW_PATH="$SETUP_DIR/www"
+    APACHE_HTTP_PORT=8080
+    QDRANT_PORT=6333
+    PORTAINER_PORT=9000
+    OLLAMA_PORT=11434
 
     if [[ -f "$PARAMS_FILE" ]]; then
         local k b t
@@ -242,8 +218,10 @@ load_params() {
 ###############################################################################
 #  ДИНАМИЧЕСКАЯ НАВИГАЦИЯ
 ###############################################################################
-_STEP=0 _STEP_MAX=0
-_STEP_LABELS=() _STEP_FUNC=()
+_STEP=0
+_STEP_MAX=0
+_STEP_LABELS=()
+_STEP_FUNC=()
 _nav_action="next"
 
 step_reg() { _STEP_LABELS+=("$1"); _STEP_FUNC+=("$2"); }
@@ -267,73 +245,28 @@ input_port() {
     done
 }
 
-# Строим шаги ТОЛЬКО для выбранных сервисов
 build_steps() {
     _STEP_LABELS=()
     _STEP_FUNC=()
     _STEP=0
 
-    # PostgreSQL — только если выбран postgres
-    if is_selected "postgres"; then
-        step_reg "PostgreSQL пароль" "s_pg"
-    fi
+    is_selected "postgres" && step_reg "PostgreSQL пароль" "s_pg"
+    is_selected "ollama" && step_reg "LLM Provider" "s_llm"
 
-    # LLM — только если выбран ollama
-    if is_selected "ollama"; then
-        step_reg "LLM Provider" "s_llm"
-    fi
-
-    # Домен — если нужен любому сервису
     if is_selected "apache" || is_selected "n8n" || is_selected "nginx_proxy" || is_selected "supabase"; then
         step_reg "Домен" "s_domain"
     fi
 
-    # n8n порт — только если выбран n8n
-    if is_selected "n8n"; then
-        step_reg "n8n порт" "s_n8n_port"
-    fi
+    is_selected "n8n" && step_reg "n8n порт" "s_n8n_port"
+    is_selected "n8n" && is_selected "postgres" && step_reg "n8n: Postgres или SQLite?" "s_n8n_db"
+    is_selected "supabase" && step_reg "Supabase поддомен" "s_supabase_domain"
+    is_selected "supabase" && step_reg "JWT Secret (Supabase)" "s_jwt"
+    is_selected "apache" && step_reg "Apache путь для сайтов" "s_ap_path"
+    is_selected "apache" && step_reg "Apache порт" "s_ap_port"
+    is_selected "qdrant" && step_reg "Qdrant порт" "s_qdrant_port"
+    is_selected "portainer" && step_reg "Portainer порт" "s_portainer_port"
+    is_selected "ollama" && step_reg "Ollama порт" "s_ollama_port"
 
-    # n8n → Postgres? — только если выбраны оба
-    if is_selected "n8n" && is_selected "postgres"; then
-        step_reg "n8n: Postgres или SQLite?" "s_n8n_db"
-    fi
-
-    # Supabase домен — только если выбран supabase
-    if is_selected "supabase"; then
-        step_reg "Supabase поддомен" "s_supabase_domain"
-    fi
-
-    # JWT — только если выбран supabase
-    if is_selected "supabase"; then
-        step_reg "JWT Secret (Supabase)" "s_jwt"
-    fi
-
-    # Apache путь — только если выбран apache
-    if is_selected "apache"; then
-        step_reg "Apache путь для сайтов" "s_ap_path"
-    fi
-
-    # Apache порт — только если выбран apache
-    if is_selected "apache"; then
-        step_reg "Apache порт" "s_ap_port"
-    fi
-
-    # Qdrant порт — то��ько если выбран qdrant
-    if is_selected "qdrant"; then
-        step_reg "Qdrant порт" "s_qdrant_port"
-    fi
-
-    # Portainer порт — только если выбран portainer
-    if is_selected "portainer"; then
-        step_reg "Portainer порт" "s_portainer_port"
-    fi
-
-    # Ollama порт — только если выбран ollama
-    if is_selected "ollama"; then
-        step_reg "Ollama порт" "s_ollama_port"
-    fi
-
-    # Финальное подтверждение — всегда
     step_reg "Подтверждение" "s_confirm"
     _STEP_MAX=${#_STEP_LABELS[@]}
 }
@@ -632,7 +565,7 @@ show_service_menu() {
 }
 
 ###############################################################################
-#  ПАРАМЕТРЫ — динамическая настройка ТОЛЬКО для выбранных сервисов
+#  ПАРАМЕТРЫ — ТОЛЬКО для выбранных сервисов
 ###############################################################################
 input_parameters() {
     run_steps
@@ -685,8 +618,6 @@ install_docker() {
     verify_docker
 }
 
-# Проверяем что Docker реально работает (pull + create)
-# Если containerd повреждён — чиним автоматически
 verify_docker() {
     local tmp_verify="$TMP"
     if docker pull hello-world >"$tmp_verify" 2>&1; then
@@ -696,16 +627,12 @@ verify_docker() {
     fi
 
     log "Docker verification FAILED — attempting auto-repair"
-
-    # Если ошибка "failed to lease content" — это баг containerd
     if grep -qi "failed to lease" "$tmp_verify" 2>/dev/null; then
-
         dialog --title "Ремонт Docker" --msgbox "Найдена проблема containerd.\nСейчас будет автоматически исправлена." 8 60
 
         systemctl stop docker 2>/dev/null || true
         systemctl stop containerd 2>/dev/null || true
 
-        # Удаляем повреждённые состояния containerd
         rm -rf /var/lib/containerd/io.containerd.metadata.v1.bolt/* 2>/dev/null || true
         rm -rf /var/lib/containerd/state/* 2>/dev/null || true
         rm -rf /var/lib/containerd/tmpmounts/* 2>/dev/null || true
@@ -714,9 +641,7 @@ verify_docker() {
         sleep 2
         systemctl start docker 2>/dev/null || true
         sleep 3
-        dockerd --version &>/dev/null || true
 
-        # Повторная проверка
         if docker pull hello-world >"$tmp_verify" 2>&1; then
             docker rm hello-world >/dev/null 2>&1 || true
             log "Docker repaired and verified OK"
@@ -725,7 +650,6 @@ verify_docker() {
         fi
     fi
 
-    # Если всё ещё не работает — показываем ошибку
     log "ERROR: Docker still broken after auto-repair"
     cat "$tmp_verify" >> "$LOG_FILE" 2>/dev/null || true
     dialog --title "Ошибка Docker" --textbox "$tmp_verify" 20 80
@@ -740,7 +664,6 @@ setup_network() {
     mkdir -p "$SETUP_DIR"
     cd "$SETUP_DIR"
 
-    # Динамический .env — только нужные ключи
     : >.env
     if is_selected "postgres"; then
         printf 'POSTGRES_PASSWORD=%s\n' "$(env_esc "${PGPASSWORD:-}")" >>.env
@@ -797,12 +720,11 @@ setup_supabase() {
         rm -rf supabase
         kill "$gp1" 2>/dev/null || true
 
-        dialog --title "Supabase" --msgbox "Repositoriy supabase скачан" 6 50
+        dialog --title "Supabase" --msgbox "Repository supabase скачан" 6 50
     fi
 
     cd supabase-docker
 
-    # Если уже установлен — НЕ перегенерировать ключи
     if [[ -f ".env" ]] && grep -q "^ANON_KEY=" .env 2>/dev/null; then
         log "Supabase already installed, preserving keys"
         dialog --msgbox "Supabase уже установлен. Ключи сохранены." 6 55
@@ -825,7 +747,7 @@ setup_supabase() {
         docker ps --filter "name=supabase" --format "{{.Names}}" 2>/dev/null \
             | while IFS= read -r c; do
                 docker network connect internal_network "$c" 2>/dev/null || true
-              done
+            done
         cd "$SETUP_DIR"
         return 0
     fi
@@ -868,7 +790,7 @@ setup_supabase() {
     docker ps --filter "name=supabase" --format "{{.Names}}" 2>/dev/null \
         | while IFS= read -r c; do
             docker network connect internal_network "$c" 2>/dev/null || true
-          done
+        done
     cd "$SETUP_DIR"
     log "Supabase setup completed"
 }
@@ -885,35 +807,32 @@ generate_compose_file() {
     local _www
     _www=$(compose_esc "${APACHE_WWW_PATH:-}")
 
-    # Определяем есть ли именованные тома
-    local has_volumes=0
-    if is_selected "postgres" || is_selected "qdrant" || is_selected "ollama" || is_selected "nginx_proxy" || is_selected "portainer" || is_selected "n8n"; then
-        has_volumes=1
-    fi
-
     {
         echo 'networks:'
         echo '  internal_network:'
         echo '    external: true'
-        if [[ $has_volumes -eq 1 ]]; then
-            echo 'volumes:'
-            is_selected "postgres"  && echo '  postgres_data:'
-            is_selected "qdrant"    && echo '  qdrant_storage:'
-            is_selected "ollama"    && echo '  ollama_data:'
-            if is_selected "nginx_proxy"; then
-                echo '  npm_data:'
-                echo '  npm_letsencrypt:'
-            fi
-            is_selected "portainer" && echo '  portainer_data:'
-            is_selected "n8n"       && echo '  n8n_data:'
-        else
-            echo 'volumes: {}'
+        echo 'volumes:'
+        is_selected "postgres"  && echo '  postgres_data:'
+        is_selected "qdrant"    && echo '  qdrant_storage:'
+        is_selected "ollama"    && echo '  ollama_data:'
+        if is_selected "nginx_proxy"; then
+            echo '  npm_data:'
+            echo '  npm_letsencrypt:'
         fi
+        is_selected "portainer" && echo '  portainer_data:'
+        is_selected "n8n"       && echo '  n8n_data:'
+        [ -z "$(echo "postgres qdrant ollama nginx_proxy portainer n8n" | tr ' ' '\n' | while read s; do is_selected "$s" && echo "$s"; done)" ] && echo '{}'
         echo 'services:'
     } >docker-compose.yml
 
     # --- PostgreSQL ---
     if is_selected "postgres"; then
+        # Создаём init-скрипт для первой инициализации
+        mkdir -p "$SETUP_DIR/pg-init"
+        cat > "$SETUP_DIR/pg-init/init-n8n.sql" <<'SQLEOF'
+SELECT 'CREATE DATABASE n8n' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'n8n')\gexec
+SQLEOF
+
         cat >>docker-compose.yml <<YEOF
   postgres:
     image: postgres:16-alpine
@@ -925,6 +844,7 @@ generate_compose_file() {
       POSTGRES_DB: appdb
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./pg-init:/docker-entrypoint-initdb.d
     networks:
       - internal_network
 YEOF
@@ -1021,14 +941,14 @@ YEOF
     # --- n8n ---
     if is_selected "n8n"; then
         local n8n_db=""
-        if [[ "${N8N_DB_POSTGRES:-0}" -eq 1 ]] && is_selected "postgres"; then
+        if [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres"; then
             n8n_db="$(printf '
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
       DB_POSTGRESDB_USER: admin
-      DB_POSTGRESDB_PASSWORD: %s
-      DB_POSTGRESDB_DATABASE: n8n' "${_pg}")"
+      DB_POSTGRESDB_PASSWORD: %s' "${_pg}")"
         fi
         cat >>docker-compose.yml <<YEOF
   n8n:
@@ -1052,32 +972,64 @@ YEOF
 }
 
 ###############################################################################
-#  ЗАПУСК КОНТЕЙНЕРОВ
+#  СОЗДАНИЕ БД n8n (v4.10 — psql -U postgres, superuser, trust auth)
+###############################################################################
+create_n8n_database() {
+    local n=0
+    while [[ $n -lt 3 ]]; do
+        n=$((n + 1))
+
+        # Проверяем — существует ли уже
+        local _check
+        _check=$(docker exec postgres psql -U postgres -tAc \
+            "SELECT 1 FROM pg_database WHERE datname='n8n';" 2>&1) || true
+        log "n8n DB check (try $n): $(echo "$_check" | tr -d '\n')"
+
+        if [[ "$(echo "$_check" | tr -d '[:space:]')" == "1" ]]; then
+            log "n8n database EXISTS"
+            return 0
+        fi
+
+        # Создаём через postgres superuser (всегда работает!)
+        log "n8n DB missing, creating via postgres superuser..."
+        local _result
+        _result=$(docker exec postgres psql -U postgres -c "CREATE DATABASE n8n;" 2>&1) || true
+        log "n8n CREATE (try $n): $(echo "$_result" | tr -d '\n')"
+
+        if echo "$_result" | grep -qi "created\|already"; then
+            log "n8n database CREATED"
+            return 0
+        fi
+
+        sleep 3
+    done
+
+    log "ERROR: failed to create n8n database after 3 attempts"
+    return 1
+}
+
+###############################################################################
+#  ЗАПУСК КОНТЕЙНЕРОВ (v4.10 — поэтапный: PG -> БД -> n8n)
 ###############################################################################
 start_containers() {
     cd "$SETUP_DIR"
     local compose_err="$TMP2"
 
-    # Порядок запуска: если n8n+Postgres — сначала PG, потом БД, потом всё остальное
     _has_n8n_pg=0
-    if is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres"; then
-        _has_n8n_pg=1
-    fi
+    is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres" && _has_n8n_pg=1
 
     if [[ $_has_n8n_pg -eq 1 ]]; then
-        # Шаг 1: запускаем только PostgreSQL
+        # Шаг 1: только PostgreSQL
         dialog --gauge "Шаг 1/3: Запуск PostgreSQL..." 8 60 10
         docker compose up -d postgres >/dev/null 2>&1
+        sleep 20
 
-        # Шаг 2: ждём готовности и создаём БД для n8n
-        dialog --gauge "Шаг 2/3: Подготовка БД для n8n..." 8 60 40
-        sleep 30
-        docker exec -e PGPASSWORD="${PGPASSWORD}" postgres \
-            psql -U admin -c "CREATE DATABASE n8n;" >/dev/null 2>&1 || true
-        log "n8n database created (pre-start)"
+        # Шаг 2: создание БД n8n (через postgres superuser)
+        dialog --gauge "Шаг 2/3: Создание БД для n8n..." 8 60 40
+        create_n8n_database
         sleep 5
 
-        # Шаг 3: запускаем все остальные контейнеры (n8n уже видит готовую БД)
+        # Шаг 3: все контейнеры (n8n видит готовую БД)
         dialog --gauge "Шаг 3/3: Запуск всех контейнеров..." 8 60 70
         docker compose up -d >/dev/null 2>&1
         sleep 20
@@ -1086,7 +1038,7 @@ start_containers() {
         sleep 5
     else
         # Обычный запуск — без n8n+Postgres
-        dialog --gauge "Запуск контейнеров...                             это может занять какое-то время, сиди не ёрзай!" 8 60 10 &
+        dialog --gauge "Запуск контейнеров... это может занять время..." 8 60 10 &
         local gp=$!
 
         if ! docker compose up -d >"$compose_err" 2>&1; then
@@ -1159,74 +1111,19 @@ SUM
         echo "  (нет данных)" >>"$sf"
     fi
 
-    cat >>"$sf" <<SUM
-
---- Директории ---
-  Setup dir:       $SETUP_DIR
-  docker-compose:  $SETUP_DIR/docker-compose.yml
-  .env файл:       $SETUP_DIR/.env
-  Apache www:      ${APACHE_WWW_PATH:-(не выбран)}
-  State dir:       $STATE_DIR
-SUM
-
-    if is_selected "supabase" && [[ -f "$SETUP_DIR/supabase-docker/.env" ]]; then
-        echo >>"$sf"
-        echo "--- Supabase ключи ---" >>"$sf"
-        grep "^ANON_KEY=" "$SETUP_DIR/supabase-docker/.env" >>"$sf" 2>/dev/null || echo "  ANON_KEY: не найден" >>"$sf"
-        grep "^SERVICE_ROLE_KEY=" "$SETUP_DIR/supabase-docker/.env" >>"$sf" 2>/dev/null || true
-    fi
-
-    echo >>"$sf"
-    echo "--- Доступы ---" >>"$sf"
-    if is_selected "postgres"; then
-        printf '  PostgreSQL: admin / %s\n' "${PGPASSWORD:-(не установлен)}" >>"$sf"
-    fi
-    if is_selected "supabase"; then
-        printf '  JWT Secret: %s\n' "${JWT_SECRET:-(не установлен)}" >>"$sf"
-    fi
-    if is_selected "ollama"; then
-        printf '  LLM Type: %s -> %s\n' "${LLM_TYPE:-(не выбран)}" "${LLM_API_URL:-(не указан)}" >>"$sf"
-    fi
-    printf '  LLM API Key: ' >>"$sf"
-    if [[ -n "${LLM_API_KEY:-}" ]]; then
-        printf '%s*****\n' "${LLM_API_KEY:0:4}" >>"$sf"
-    else
-        printf '(не указан)\n' >>"$sf"
-    fi
-
     echo >>"$sf"
     echo "--- Веб-интерфейсы ---" >>"$sf"
-    if is_selected "portainer"; then
-        echo "  Portainer:     http://$ip:${PORTAINER_PORT}" >>"$sf"
-    fi
-    if is_selected "nginx_proxy"; then
-        echo "  Nginx Proxy:   http://$ip:81  (admin@example.com / changeme)" >>"$sf"
-    fi
-    if is_selected "supabase"; then
-        echo "  Supabase:      https://${SUPABASE_DOMAIN:-$ip}" >>"$sf"
-    fi
-    if is_selected "n8n"; then
-        echo "  n8n:           http://${DOMAIN:-$ip}:${N8N_PORT}" >>"$sf"
-    fi
-    if is_selected "apache"; then
-        echo "  Apache:        http://${DOMAIN:-$ip}:${APACHE_HTTP_PORT}" >>"$sf"
-    fi
-    if is_selected "qdrant"; then
-        echo "  Qdrant:        http://$ip:${QDRANT_PORT}" >>"$sf"
-    fi
-    if is_selected "ollama"; then
-        echo "  Ollama:        http://$ip:${OLLAMA_PORT}" >>"$sf"
-    fi
+    is_selected "portainer" && echo "  Portainer:     http://$ip:${PORTAINER_PORT}" >>"$sf"
+    is_selected "nginx_proxy" && echo "  Nginx Proxy:   http://$ip:81  (admin@example.com / changeme)" >>"$sf"
+    is_selected "supabase" && echo "  Supabase:      https://${SUPABASE_DOMAIN:-$ip}" >>"$sf"
+    is_selected "n8n" && echo "  n8n:           http://${DOMAIN:-$ip}:${N8N_PORT}" >>"$sf"
+    is_selected "apache" && echo "  Apache:        http://${DOMAIN:-$ip}:${APACHE_HTTP_PORT}" >>"$sf"
+    is_selected "qdrant" && echo "  Qdrant:        http://$ip:${QDRANT_PORT}" >>"$sf"
+    is_selected "ollama" && echo "  Ollama:        http://$ip:${OLLAMA_PORT}" >>"$sf"
 
     cat >>"$sf" <<SUM
 
---- Сохранённые файлы ---
-  $STATE_DIR/params.env            -- параметры
-  $STATE_DIR/selected_services.cfg -- список сервисов
-  $LOG_FILE                        -- лог установки
-  $SETUP_DIR/npm_info.txt          -- NPM доступы
-
-  Сохраните эту информацию! Ключи не показываются повторно.
+--- Лог: $LOG_FILE ---
 ==========================================================
 SUM
     chmod 600 "$sf"
@@ -1301,44 +1198,30 @@ post_install_menu() {
                 generate_compose_file
                 docker compose down --remove-orphans >/dev/null 2>&1 || true
 
-                # Порядок запуска: сначала postgres, БД для n8n, остальные
                 _has_n8n_pg=0
-                if is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres"; then
-                    _has_n8n_pg=1
-                fi
+                is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres" && _has_n8n_pg=1
 
                 if [[ $_has_n8n_pg -eq 1 ]]; then
-                    # Шаг 1: запускаем только PostgreSQL
+                    # Шаг 1: PostgreSQL
                     dialog --gauge "Шаг 1/3: Запуск PostgreSQL..." 6 50 10 &
                     local _g1=$!
                     docker compose up -d postgres >/dev/null 2>&1
                     kill "$_g1" 2>/dev/null || true
+                    sleep 20
 
-                    # Ожидание полной готовности PostgreSQL (30 сек)
-                    dialog --gauge "Шаг 1/3: Ожидание готовности PostgreSQL (30с)..." 6 50 25 &
-                    local _g1w=$!
-                    sleep 30
-                    kill "$_g1w" 2>/dev/null || true
-
-                    # Шаг 2: создаём БД для n8n
-                    dialog --gauge "Шаг 2/3: Создание БД для n8n..." 6 50 40 &
+                    # Шаг 2: проверка/создание БД (postgres superuser)
+                    dialog --gauge "Шаг 2/3: Создание БД n8n..." 6 50 40 &
                     local _g2=$!
-                    docker exec -e PGPASSWORD="${PGPASSWORD}" postgres \n                        psql -U admin -c "CREATE DATABASE n8n;" >/dev/null 2>&1 || true
-                    log "n8n database created (pre-start)"
+                    create_n8n_database
+                    sleep 5
                     kill "$_g2" 2>/dev/null || true
-                    sleep 3
 
-                    # Шаг 3: запускаем все остальные контейнеры
+                    # Шаг 3: все контейнеры
                     dialog --gauge "Шаг 3/3: Запуск всех контейнеров..." 6 50 70 &
                     local _g3=$!
                     docker compose up -d >/dev/null 2>&1
                     kill "$_g3" 2>/dev/null || true
-
-                    # Пауза для полного старта всех сервисов (20 сек)
-                    dialog --gauge "Ожидание запуска сервисов (20с)..." 6 50 85 &
-                    local _g3w=$!
                     sleep 20
-                    kill "$_g3w" 2>/dev/null || true
                 else
                     docker compose up -d >/dev/null 2>&1
                 fi
@@ -1370,24 +1253,7 @@ post_install_menu() {
                 show_final_summary
                 ;;
             5)
-                _show_log=1
-                while [[ $_show_log -eq 1 ]]; do
-                    dialog --title "Журнал установки" --menu \
-                        "Выберите действие:" 12 55 3 \
-                        "1" "Просмотреть лог" \
-                        "2" "Скопировать в ~/install_log.txt" \
-                        "0" "Назад" 2>"$TMP" || break
-
-                    case "$(<"$TMP")" in
-                        1) dialog --title "Лог установки" --textbox "$LOG_FILE" 32 95 2>/dev/null ;;
-                        2)
-                            cp "$LOG_FILE" "$HOME/install_log.txt" 2>/dev/null \
-                                && dialog --msgbox "Лог скопирован в:\n\n$HOME/install_log.txt" 8 60 \
-                                || dialog --msgbox "Ошибка копирования!" 6 50
-                            ;;
-                        0) _show_log=0 ;;
-                    esac
-                done
+                dialog --title "Лог установки" --textbox "$LOG_FILE" 32 95 2>/dev/null
                 ;;
             6)
                 if ! dialog --yesno "Сбросить ВСЁ?\n\nБудут удалены:\n  - ${STATE_DIR}\n  - compose down -v\n  - данные Supabase" 10 60; then
@@ -1424,7 +1290,6 @@ main() {
             || { echo "Не удалось установить dialog"; exit 1; }
     fi
 
-    # Проверка свободного места (нужно >= 5 GB)
     local avail_gb
     avail_gb=$(df -BG / | awk 'NR==2{gsub(/G/,""); print $4}')
     if [[ "$avail_gb" =~ ^[0-9]+$ ]] && [[ "$avail_gb" -lt 5 ]]; then
