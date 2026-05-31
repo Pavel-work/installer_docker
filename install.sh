@@ -845,31 +845,64 @@ setup_supabase() {
     pushd "$SETUP_DIR" >/dev/null || { log "ERROR: Cannot pushd to $SETUP_DIR"; return 1; }
 
     if [[ ! -d "supabase-docker" ]]; then
-        dialog --title "Supabase (1/2)" --gauge "Клонирование репозитория supabase (timeout 5мин)..." 8 60 20
-        log "Supabase: starting git clone with timeout..."
+        dialog --title "Supabase (1/2)" --gauge "Скачивание supabase/docker..." 8 60 20
+        log "Supabase: downloading docker folder from GitHub..."
 
-        # timeout 5 минут — git clone может зависнуть навсегда
-        if ! timeout 300 git clone --depth 1 --filter=blob:none --sparse https://github.com/supabase/supabase >> "$LOG_FILE" 2>&1; then
-            log "ERROR: Git clone supabase FAILED or TIMED OUT"
-            rm -rf supabase 2>/dev/null || true
-            popd >/dev/null 2>&1 || true
-            dialog --title "Ошибка" --msgbox "Не удалось скачать репозиторий Supabase.\nПроверьте интернет-соединение.\nTimeout 5 минут истёк.\nЛог: $LOG_FILE" 14 60
-            return 1
-        fi
-
-        if [[ ! -d "supabase/docker" ]]; then
+        # Скачиваем только папку docker из репозитория (быстро и надёжно)
+        # Используем tarball GitHub вместо git clone (сломался sparse-checkout)
+        if command -v curl &>/dev/null; then
+            local _archive="$SETUP_DIR/supabase-docker.tar.gz"
+            if timeout 120 curl -fSLo "$_archive" \
+                "https://github.com/supabase/supabase/archive/refs/heads/master.tar.gz" >> "$LOG_FILE" 2>&1; then
+                log "Supabase: archive downloaded, extracting docker folder..."
+                mkdir -p "$SETUP_DIR/supabase-tmp"
+                if tar -xzf "$_archive" -C "$SETUP_DIR/supabase-tmp" --strip-components=1 2>&1 >> "$LOG_FILE"; then
+                    if [[ -d "$SETUP_DIR/supabase-tmp/docker" ]]; then
+                        mv "$SETUP_DIR/supabase-tmp/docker" "$SETUP_DIR/supabase-docker"
+                    else
+                        # Попробуем с другим именем ветки
+                        local _first_dir
+                        _first_dir=$(ls "$SETUP_DIR/supabase-tmp/" 2>/dev/null | head -1)
+                        if [[ -d "$SETUP_DIR/supabase-tmp/$_first_dir/docker" ]]; then
+                            mv "$SETUP_DIR/supabase-tmp/$_first_dir/docker" "$SETUP_DIR/supabase-docker"
+                        else
+                            log "ERROR: docker folder not found in archive"
+                        fi
+                    fi
+                fi
+                rm -rf "$SETUP_DIR/supabase-tmp" "$_archive"
+            else
+                log "ERROR: curl download failed, trying git clone..."
+                # Fallback: обычный shallow clone
+                if ! timeout 300 git clone --depth 1 --no-tags https://github.com/supabase/supabase >> "$LOG_FILE" 2>&1; then
+                    rm -rf supabase 2>/dev/null || true
+                    popd >/dev/null 2>&1 || true
+                    dialog --title "Ошибка" --msgbox "Не удалось скачать Supabase.\nНет интернета или блокировка GitHub.\nЛог: $LOG_FILE" 12 55
+                    return 1
+                fi
+                [[ -d "supabase/docker" ]] && mv supabase/docker supabase-docker
+                rm -rf supabase
+            fi
+        else
+            # Нет curl — git clone fallback
+            if ! timeout 300 git clone --depth 1 --no-tags https://github.com/supabase/supabase >> "$LOG_FILE" 2>&1; then
+                rm -rf supabase 2>/dev/null || true
+                popd >/dev/null 2>&1 || true
+                dialog --title "Ошибка" --msgbox "Не удалось скачать Supabase.\nНет интернета или блокировка GitHub.\nЛог: $LOG_FILE" 12 55
+                return 1
+            fi
+            [[ -d "supabase/docker" ]] && mv supabase/docker supabase-docker
             rm -rf supabase
-            log "ERROR: supabase/docker directory not found in repo"
-            popd >/dev/null 2>&1 || true
-            dialog --title "Ошибка" --msgbox "В репозитории Supabase нет папки docker.\nЛог: $LOG_FILE" 10 60
-            return 1
         fi
 
-        log "Supabase: running sparse-checkout..."
-        (cd supabase && git sparse-checkout set docker >> "$LOG_FILE" 2>&1)
-        mv supabase/docker supabase-docker
-        rm -rf supabase
-        log "Supabase repository cloned successfully"
+        if [[ ! -d "supabase-docker" ]]; then
+            rm -rf supabase supabase-tmp supabase-docker.tar.gz
+            log "ERROR: supabase-docker directory not created after download"
+            popd >/dev/null 2>&1 || true
+            dialog --title "Ошибка" --msgbox "Не удалось получить папку docker из репозитория Supabase.\nЛог: $LOG_FILE" 10 60
+            return 1
+        fi
+        log "Supabase docker folder downloaded successfully"
     fi
 
     # ВАЖНО: проверяем что supabase-docker существует перед cd
