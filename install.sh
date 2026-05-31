@@ -581,19 +581,19 @@ install_docker() {
         dialog --gauge "Обновление пакетов..." 8 60 0 &
         local gauge_pid=$!
 
-        apt-get update >/dev/null 2>&1
+        apt-get update >> "$LOG_FILE" 2>&1
         kill "$gauge_pid" 2>/dev/null || true
 
         dialog --gauge "Скачивание установки..." 8 60 33 &
         gauge_pid=$!
 
-        curl -fsSL https://get.docker.com -o "$TMP" >/dev/null 2>&1
+        curl -fsSL https://get.docker.com -o "$TMP" >> "$LOG_FILE" 2>&1
         kill "$gauge_pid" 2>/dev/null || true
 
         dialog --gauge "Установка Docker..." 8 60 66 &
         gauge_pid=$!
 
-        bash "$TMP" >/dev/null 2>&1
+        bash "$TMP" >> "$LOG_FILE" 2>&1
         kill "$gauge_pid" 2>/dev/null || true
 
         usermod -aG docker "$REAL_USER" 2>/dev/null || true
@@ -611,8 +611,8 @@ install_docker() {
 
     if ! docker compose version &>/dev/null; then
         log "Installing docker-compose-plugin..."
-        apt-get update >/dev/null 2>&1 || true
-        apt-get install -y docker-compose-plugin >/dev/null 2>&1
+        apt-get update >> "$LOG_FILE" 2>&1 || true
+        apt-get install -y docker-compose-plugin >> "$LOG_FILE" 2>&1 || true
     fi
     log "Docker ready"
     verify_docker
@@ -702,32 +702,96 @@ setup_network() {
 ###############################################################################
 #  SUPABASE
 ###############################################################################
+verify_supabase() {
+    local supa_count
+    supa_count=$(docker ps --filter "name=supabase" --filter "status=running" --format "{{.Names}}" 2>/dev/null | wc -l)
+    if [[ "$supa_count" -gt 0 ]]; then
+        log "Supabase verification OK: $supa_count containers running"
+        return 0
+    fi
+    log "ERROR: Supabase verification FAILED — no running containers"
+    return 1
+}
+
+supabase_compose_up() {
+    local max_attempts=2 attempt=0
+    while [[ $attempt -lt $max_attempts ]]; do
+        attempt=$((attempt + 1))
+        log "Supabase compose up attempt $attempt..."
+        if docker compose -p supabase up -d >> "$LOG_FILE" 2>&1; then
+            log "Supabase compose up (attempt $attempt) succeeded"
+            sleep 15
+            if verify_supabase; then
+                return 0
+            fi
+            log "Supabase compose up succeeded but verification failed, retrying..."
+            docker compose -p supabase down 2>&1 | tee -a "$LOG_FILE"
+        else
+            log "ERROR: Supabase compose up attempt $attempt FAILED"
+        fi
+        sleep 5
+    done
+    return 1
+}
+
+connect_supabase_to_network() {
+    docker ps --filter "name=supabase" --filter "status=running" --format "{{.Names}}" 2>/dev/null \
+        | while IFS= read -r c; do
+            docker network connect internal_network "$c" 2>/dev/null || true
+        done
+}
+
 setup_supabase() {
     if ! is_selected "supabase"; then
         return 0
     fi
 
-    cd "$SETUP_DIR"
+    cd "$SETUP_DIR" || { log "ERROR: Cannot cd to $SETUP_DIR"; return 1; }
     log "Supabase setup started"
 
     if [[ ! -d "supabase-docker" ]]; then
-        dialog --title "Supabase (1/2)" --gauge "Клонирование репозитория..." 8 60 20 &
+        dialog --title "Supabase (1/2)" --gauge "Клонирование репозитория supabase..." 8 60 20 &
         local gp1=$!
 
-        git clone --depth 1 --filter=blob:none --sparse https://github.com/supabase/supabase >/dev/null 2>&1
-        (cd supabase && git sparse-checkout set docker >/dev/null 2>&1)
+        if ! git clone --depth 1 --filter=blob:none --sparse https://github.com/supabase/supabase >> "$LOG_FILE" 2>&1; then
+            kill "$gp1" 2>/dev/null || true
+            log "ERROR: Git clone supabase FAILED"
+            dialog --title "Ошибка" --msgbox "Не удалось скачать репозиторий Supabase.\nПроверьте интернет-соединение и git.\n\nЛог: $LOG_FILE" 12 60
+            cd "$SETUP_DIR"
+            return 1
+        fi
+
+        if [[ ! -d "supabase/docker" ]]; then
+            kill "$gp1" 2>/dev/null || true
+            rm -rf supabase
+            log "ERROR: supabase/docker directory not found in repo"
+            dialog --title "Ошибка" --msgbox "В репозитории Supabase нет папки docker.\nВерсия изменилась? Лог: $LOG_FILE" 10 60
+            cd "$SETUP_DIR"
+            return 1
+        fi
+
+        (cd supabase && git sparse-checkout set docker >> "$LOG_FILE" 2>&1)
         mv supabase/docker supabase-docker
         rm -rf supabase
         kill "$gp1" 2>/dev/null || true
 
-        dialog --title "Supabase" --msgbox "Repository supabase скачан" 6 50
+        log "Supabase repository cloned successfully"
     fi
 
-    cd supabase-docker
+    # ВАЖНО: проверяем что supabase-docker существует перед cd
+    if [[ ! -d "supabase-docker" ]]; then
+        log "ERROR: supabase-docker directory missing after clone!"
+        dialog --title "Ошибка" --msgbox "Папка supabase-docker не найдена.\nУдалите $SETUP_DIR/supabase-docker вручную и запустите снова." 10 60
+        cd "$SETUP_DIR"
+        return 1
+    fi
 
+    cd supabase-docker || { log "ERROR: cd supabase-docker failed"; cd "$SETUP_DIR"; return 1; }
+
+    # --- Существующая установка ---
     if [[ -f ".env" ]] && grep -q "^ANON_KEY=" .env 2>/dev/null; then
         log "Supabase already installed, preserving keys"
-        dialog --msgbox "Supabase уже установлен. Ключи сохранены." 6 55
+
         if [[ -n "${PGPASSWORD:-}" ]]; then
             inject_env .env POSTGRES_PASSWORD "${PGPASSWORD}"
         fi
@@ -742,14 +806,24 @@ setup_supabase() {
         if ! grep -q "internal_network" docker-compose.yml; then
             printf '\nnetworks:\n  internal_network:\n    external: true\n' >> docker-compose.yml
         fi
-        docker compose -p supabase up -d >/dev/null 2>&1
-        sleep 5
-        docker ps --filter "name=supabase" --format "{{.Names}}" 2>/dev/null \
-            | while IFS= read -r c; do
-                docker network connect internal_network "$c" 2>/dev/null || true
-            done
+
+        if supabase_compose_up; then
+            connect_supabase_to_network
+            dialog --title "Supabase" --msgbox "Supabase (обновление) запущен и работает!" 6 55
+        else
+            log "ERROR: Supabase restart failed"
+            dialog --title "Ошибка" --msgbox "Supabase не удалось перезапустить.\nЛог: $LOG_FILE" 8 50
+        fi
         cd "$SETUP_DIR"
         return 0
+    fi
+
+    # --- Новая установка ---
+    if [[ ! -f ".env.example" ]]; then
+        log "ERROR: .env.example not found in supabase-docker"
+        dialog --title "Ошибка" --msgbox "Файл .env.example не найден в supabase-docker.\nВозможно, структура репозитория изменилась.\nЛог: $LOG_FILE" 10 60
+        cd "$SETUP_DIR"
+        return 1
     fi
 
     cp .env.example .env
@@ -781,18 +855,18 @@ setup_supabase() {
         printf '\nnetworks:\n  internal_network:\n    external: true\n' >> docker-compose.yml
     fi
 
-    dialog --title "Supabase (2/2)" --gauge "Запуск контейнеров..." 8 60 50 &
-    local gp2=$!
-    docker compose -p supabase up -d >/dev/null 2>&1
-    kill "$gp2" 2>/dev/null || true
-    sleep 10
+    log "Supabase: starting containers (new install)"
 
-    docker ps --filter "name=supabase" --format "{{.Names}}" 2>/dev/null \
-        | while IFS= read -r c; do
-            docker network connect internal_network "$c" 2>/dev/null || true
-        done
+    dialog --title "Supabase (2/2)" --gauge "Запуск Supabase... это может занять время..." 8 60 50
+    if supabase_compose_up; then
+        connect_supabase_to_network
+        dialog --title "Supabase" --msgbox "Supabase запущен и работает!" 6 50
+        log "Supabase setup completed successfully"
+    else
+        log "ERROR: Supabase first start FAILED"
+        dialog --title "Ошибка Supabase" --msgbox "Supabase НЕ запустился.\nЛог: $LOG_FILE\n\nПроверьте:\n- Порты 3000, 54322, 8000 свободны\n- Docker ресурсы не исчерпаны" 14 60
+    fi
     cd "$SETUP_DIR"
-    log "Supabase setup completed"
 }
 
 ###############################################################################
@@ -1021,7 +1095,7 @@ start_containers() {
     if [[ $_has_n8n_pg -eq 1 ]]; then
         # Шаг 1: только PostgreSQL
         dialog --gauge "Шаг 1/3: Запуск PostgreSQL..." 8 60 10
-        docker compose up -d postgres >/dev/null 2>&1
+        docker compose up -d postgres >> "$LOG_FILE" 2>&1
         sleep 20
 
         # Шаг 2: создание БД n8n (через postgres superuser)
@@ -1031,10 +1105,12 @@ start_containers() {
 
         # Шаг 3: все контейнеры (n8n видит готовую БД)
         dialog --gauge "Шаг 3/3: Запуск всех контейнеров..." 8 60 70
-        docker compose up -d >/dev/null 2>&1
+        docker compose up -d >> "$LOG_FILE" 2>&1
         sleep 20
 
         dialog --gauge "Проверка контейнеров..." 8 60 90
+        log "Checking all containers after start..."
+        docker ps --format "{{.Names}}\t{{.Status}}" >> "$LOG_FILE" 2>&1
         sleep 5
     else
         # Обычный запуск — без n8n+Postgres
@@ -1169,12 +1245,13 @@ show_status() {
 post_install_menu() {
     while true; do
         dialog --title "Post-install управление" --menu \
-            "Установка завершена. Выберите действие:" 16 60 7 \
+            "Установка завершена. Выберите действие:" 20 60 8 \
             "1" "Установить/Добавить сервисы" \
             "2" "Переустановить сервис" \
             "3" "Проверить статус" \
             "4" "Показать сводку" \
             "5" "Показать лог" \
+            "7" "Скачать лог на локальный хост" \
             "6" "Сбросить всё" \
             "0" "Выйти" 2>"$TMP" || return 0
 
@@ -1194,38 +1271,37 @@ post_install_menu() {
                 fi
                 save_params
                 setup_network
-                setup_supabase
                 generate_compose_file
-                docker compose down --remove-orphans >/dev/null 2>&1 || true
+                # НЕ делаем 'down --remove-orphans' — это убивает ВСЕ контейнеры!
+                # Запускаем только новые сервисы из compose
 
                 _has_n8n_pg=0
                 is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres" && _has_n8n_pg=1
 
                 if [[ $_has_n8n_pg -eq 1 ]]; then
-                    # Шаг 1: PostgreSQL
                     dialog --gauge "Шаг 1/3: Запуск PostgreSQL..." 6 50 10 &
                     local _g1=$!
-                    docker compose up -d postgres >/dev/null 2>&1
+                    docker compose up -d postgres >> "$LOG_FILE" 2>&1
                     kill "$_g1" 2>/dev/null || true
                     sleep 20
 
-                    # Шаг 2: проверка/создание БД (postgres superuser)
                     dialog --gauge "Шаг 2/3: Создание БД n8n..." 6 50 40 &
                     local _g2=$!
                     create_n8n_database
                     sleep 5
                     kill "$_g2" 2>/dev/null || true
 
-                    # Шаг 3: все контейнеры
                     dialog --gauge "Шаг 3/3: Запуск всех контейнеров..." 6 50 70 &
                     local _g3=$!
-                    docker compose up -d >/dev/null 2>&1
+                    docker compose up -d >> "$LOG_FILE" 2>&1
                     kill "$_g3" 2>/dev/null || true
                     sleep 20
                 else
-                    docker compose up -d >/dev/null 2>&1
+                    docker compose up -d >> "$LOG_FILE" 2>&1
                 fi
                 show_final_summary
+                # Supabase ставим в самом конце отдельно
+                setup_supabase
                 ;;
             2)
                 local arr=() names svc
@@ -1264,6 +1340,13 @@ post_install_menu() {
                 rm -rf "$STATE_DIR" "$SETUP_DIR"
                 dialog --msgbox "Всё сброшено." 6 50
                 exec "$0"
+                ;;
+            7)
+                # Копируем лог в /tmp с правами на чтение
+                cp "$LOG_FILE" /tmp/install.log 2>/dev/null && chmod 644 /tmp/install.log 2>/dev/null
+                local _log_size
+                _log_size=$(wc -l < /tmp/install.log 2>/dev/null || echo "?")
+                dialog --title "Лог скопирован" --msgbox "Лог готов к скачиванию:\n\n  /tmp/install.log\n  Строк: ${_log_size}\n\nСкачайте локально:\n  scp -P 2222 agent@94.73.246.234:/tmp/install.log .\n\nИли просто покажите лог серверу." 16 60
                 ;;
             0)
                 return 0
@@ -1322,16 +1405,18 @@ main() {
             install_docker
             save_state "done"
             setup_network
-            setup_supabase
             generate_compose_file
             start_containers
-            print_npm_info
+            # Supabase — В КОНЦЕ (тяжёлый, много контейнеров, не должен мешать остальным)
             show_final_summary
             save_state "completed"
+            setup_supabase
+            print_npm_info
+            # Показываем финальную сводку ЕЩЁ РАЗ, теперь с Supabase
+            show_final_summary
             ;;
         done|docker_installed|network_needed)
             setup_network
-            setup_supabase
             generate_compose_file
             start_containers
             print_npm_info
