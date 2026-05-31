@@ -848,52 +848,107 @@ setup_supabase() {
         dialog --title "Supabase (1/2)" --gauge "Скачивание supabase/docker..." 8 60 20
         log "Supabase: downloading docker folder from GitHub..."
 
-        # Скачиваем только папку docker из репозитория (быстро и надёжно)
-        # Используем tarball GitHub вместо git clone (сломался sparse-checkout)
-        if command -v curl &>/dev/null; then
-            local _archive="$SETUP_DIR/supabase-docker.tar.gz"
-            # 300 секунд — архив ~230MB на медленном соединении качается 2-3 минуты
-            if timeout 300 curl -fSLo "$_archive" -s \
-                "https://github.com/supabase/supabase/archive/refs/heads/master.tar.gz" >> "$LOG_FILE" 2>&1; then
-                log "Supabase: archive downloaded, extracting docker folder..."
-                mkdir -p "$SETUP_DIR/supabase-tmp"
-                if tar -xzf "$_archive" -C "$SETUP_DIR/supabase-tmp" --strip-components=1 2>&1 >> "$LOG_FILE"; then
-                    if [[ -d "$SETUP_DIR/supabase-tmp/docker" ]]; then
-                        mv "$SETUP_DIR/supabase-tmp/docker" "$SETUP_DIR/supabase-docker"
-                    else
-                        # Попробуем с другим именем ветки
-                        local _first_dir
-                        _first_dir=$(ls "$SETUP_DIR/supabase-tmp/" 2>/dev/null | head -1)
-                        if [[ -d "$SETUP_DIR/supabase-tmp/$_first_dir/docker" ]]; then
-                            mv "$SETUP_DIR/supabase-tmp/$_first_dir/docker" "$SETUP_DIR/supabase-docker"
-                        else
-                            log "ERROR: docker folder not found in archive"
-                        fi
-                    fi
-                fi
-                rm -rf "$SETUP_DIR/supabase-tmp" "$_archive"
-            else
-                log "ERROR: curl download failed, trying git clone..."
-                # Fallback: обычный shallow clone
-                if ! timeout 300 git clone --depth 1 --no-tags https://github.com/supabase/supabase >> "$LOG_FILE" 2>&1; then
-                    rm -rf supabase 2>/dev/null || true
-                    popd >/dev/null 2>&1 || true
-                    dialog --title "Ошибка" --msgbox "Не удалось скачать Supabase.\nНет интернета или блокировка GitHub.\nЛог: $LOG_FILE" 12 55
-                    return 1
-                fi
-                [[ -d "supabase/docker" ]] && mv supabase/docker supabase-docker
-                rm -rf supabase
+        local _dl_ok=0
+        local _archive="$SETUP_DIR/supabase-docker.tar.gz"
+
+        # ===== Попытка 1: wget --continue (resume) =====
+        if command -v wget &>/dev/null; then
+            log "Supabase: attempt 1 (wget with resume)"
+            rm -f "$_archive"
+            if timeout 600 wget --tries=5 --continue --timeout=90 \
+                -O "$_archive" -q \
+                "https://codeload.github.com/supabase/supabase/tar.gz/refs/heads/master" >> "$LOG_FILE" 2>&1; then
+                _dl_ok=1
             fi
-        else
-            # Нет curl — git clone fallback
-            if ! timeout 300 git clone --depth 1 --no-tags https://github.com/supabase/supabase >> "$LOG_FILE" 2>&1; then
-                rm -rf supabase 2>/dev/null || true
+        fi
+
+        # ===== Попытка 2: curl --retry =====
+        if [[ $_dl_ok -eq 0 ]] && command -v curl &>/dev/null; then
+            log "Supabase: attempt 2 (curl with retry)"
+            rm -f "$_archive"
+            if timeout 600 curl -fSL --retry 5 --retry-delay 15 \
+                -o "$_archive" -s \
+                "https://codeload.github.com/supabase/supabase/tar.gz/refs/heads/master" >> "$LOG_FILE" 2>&1; then
+                _dl_ok=1
+            fi
+        fi
+
+        # ===== Попытка 3: github.com archive URL =====
+        if [[ $_dl_ok -eq 0 ]] && command -v curl &>/dev/null; then
+            log "Supabase: attempt 3 (github.com archive URL)"
+            rm -f "$_archive"
+            if timeout 600 curl -fSL --retry 5 --retry-delay 15 \
+                -o "$_archive" -s \
+                "https://github.com/supabase/supabase/archive/refs/heads/master.tar.gz" >> "$LOG_FILE" 2>&1; then
+                _dl_ok=1
+            fi
+        fi
+
+        # ===== Распаковка =====
+        if [[ $_dl_ok -eq 1 ]] && [[ -f "$_archive" ]]; then
+            log "Supabase: extracting docker folder from tarball..."
+            mkdir -p "$SETUP_DIR/supabase-tmp"
+            if timeout 60 tar -xzf "$_archive" -C "$SETUP_DIR/supabase-tmp" 2>> "$LOG_FILE"; then
+                local _first_dir
+                _first_dir=$(ls "$SETUP_DIR/supabase-tmp/" 2>/dev/null | head -1)
+                if [[ -n "$_first_dir" ]] && [[ -d "$SETUP_DIR/supabase-tmp/$_first_dir/docker" ]]; then
+                    mv "$SETUP_DIR/supabase-tmp/$_first_dir/docker" "$SETUP_DIR/supabase-docker"
+                    _dl_ok=2
+                else
+                    log "ERROR: docker/ not found in archive"
+                fi
+            else
+                log "ERROR: tar extraction failed"
+            fi
+            rm -rf "$SETUP_DIR/supabase-tmp" "$_archive"
+        fi
+
+        # ===== Попытка 4: GitHub API — отдельные файлы =====
+        if [[ $_dl_ok -lt 2 ]] && command -v curl &>/dev/null; then
+            log "Supabase: attempt 4 (GitHub API individual files)"
+            local _api_json="$SETUP_DIR/_api_file.json"
+            rm -rf "$SETUP_DIR/supabase-docker"
+            if curl -fSL -s -o "$_api_json" \
+                "https://api.github.com/repos/supabase/supabase/contents/docker" >> "$LOG_FILE" 2>&1; then
+                mkdir -p "$SETUP_DIR/supabase-docker"
+                local _urls
+                _urls=$(grep -o '"download_url":"[^"]*"' "$_api_json" | cut -d'"' -f4)
+                for _url in $_urls; do
+                    local _fname
+                    _fname=$(basename "$_url")
+                    log "Supabase: GET $_fname"
+                    timeout 60 curl -fSLo "$SETUP_DIR/supabase-docker/$_fname" -s "$_url" >> "$LOG_FILE" 2>&1 || true
+                done
+                rm -f "$_api_json"
+                if [[ -f "$SETUP_DIR/supabase-docker/docker-compose.yml" ]] || \
+                   [[ -f "$SETUP_DIR/supabase-docker/docker-compose.sandbox.yml" ]]; then
+                    _dl_ok=3
+                else
+                    rm -rf "$SETUP_DIR/supabase-docker"
+                fi
+            fi
+        fi
+
+        # ===== Попытка 5: git clone --depth 1 =====
+        if [[ $_dl_ok -lt 2 ]]; then
+            log "Supabase: attempt 5 (git clone --depth 1)"
+            rm -rf "$SETUP_DIR/supabase"
+            if timeout 600 git clone --depth 1 --no-tags \
+                https://github.com/supabase/supabase >> "$LOG_FILE" 2>&1; then
+                [[ -d "$SETUP_DIR/supabase/docker" ]] && mv "$SETUP_DIR/supabase/docker" "$SETUP_DIR/supabase-docker"
+                rm -rf "$SETUP_DIR/supabase"
+            fi
+            if [[ ! -d "supabase-docker" ]]; then
                 popd >/dev/null 2>&1 || true
                 dialog --title "Ошибка" --msgbox "Не удалось скачать Supabase.\nНет интернета или блокировка GitHub.\nЛог: $LOG_FILE" 12 55
                 return 1
             fi
-            [[ -d "supabase/docker" ]] && mv supabase/docker supabase-docker
-            rm -rf supabase
+        fi
+            if [[ ! -d "supabase-docker" ]]; then
+                popd >/dev/null 2>&1 || true
+                dialog --title "Ошибка" --msgbox "Не удалось скачать Supabase.\nНет интернета или блокировка GitHub.\nЛог: $LOG_FILE" 12 55
+                return 1
+            fi
         fi
 
         if [[ ! -d "supabase-docker" ]]; then
