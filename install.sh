@@ -944,12 +944,6 @@ setup_supabase() {
                 return 1
             fi
         fi
-            if [[ ! -d "supabase-docker" ]]; then
-                popd >/dev/null 2>&1 || true
-                dialog --title "Ошибка" --msgbox "Не удалось скачать Supabase.\nНет интернета или блокировка GitHub.\nЛог: $LOG_FILE" 12 55
-                return 1
-            fi
-        fi
 
         if [[ ! -d "supabase-docker" ]]; then
             rm -rf supabase supabase-tmp supabase-docker.tar.gz
