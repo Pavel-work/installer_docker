@@ -2,13 +2,17 @@
 set -uo pipefail
 
 ###############################################################################
-#  Универсальный установщик сервисов v4.1
+#  Универсальный установщик сервисов v4.2
 ###############################################################################
+#  Изменения v4.2:
+#    • Исправлено: n8n подключение к БД через post-install (CREATE DB + restart)
+#    • Удалено: копирование лога в файл (текст выделяется мышкой в textbox)
+#    • Проверка запуска контейнеров после обновления
+#
 #  Изменения v4.1:
 #    • Кнопки Далее/Назад во всех шагах настройки
 #    • Настраиваемый порт для Portainer
 #    • Увеличено окно приветствия и окна лога
-#    • Копирование лога в файл
 #    • Исправлено: меню добавления сервисов теперь показывает выбор
 #    • Исправлено: Esc в выборе сервисов возвращает назад вместо exit
 #    • Исправлено: n8n DB выбор (SQLite больше не возвращает назад)
@@ -1260,7 +1264,19 @@ post_install_menu() {
                 setup_supabase
                 generate_compose_file
                 docker compose down --remove-orphans >/dev/null 2>&1 || true
-                docker compose up -d >/dev/null 2>&1 || true
+                docker compose up -d >/dev/null 2>&1
+
+                # Если n8n с Postgres — ждём БД и создаём
+                if is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" -eq 1 ]] && is_selected "postgres"; then
+                    dialog --gauge "Настройка базы данных n8n..." 6 50 0 &
+                    local _db_gp=$!
+                    sleep 10
+                    kill "$_db_gp" 2>/dev/null || true
+                    docker exec -e PGPASSWORD="${PGPASSWORD}" postgres \
+                        psql -U admin -c "CREATE DATABASE n8n;" >/dev/null 2>&1 || true
+                    log "n8n database created"
+                    docker restart n8n >/dev/null 2>&1
+                fi
                 show_final_summary
                 ;;
             2)
@@ -1291,21 +1307,7 @@ post_install_menu() {
             5)
                 if [[ -f "$LOG_FILE" ]]; then
                     while true; do
-                        dialog --title "Лог установки" --menu \
-                            "Действия с журналом:" 12 55 3 \
-                            "1" "Просмотреть лог" \
-                            "2" "Скопировать лог в файл" \
-                            "0" "Назад" 2>"$TMP" || break
-
-                        case "$(<"$TMP")" in
-                            1) dialog --title "Лог установки" --textbox "$LOG_FILE" 36 100 2>/dev/null ;;
-                            2)
-                                local copy_path="$HOME/install_log_copy_$(date +%F_%T).txt"
-                                cp "$LOG_FILE" "$copy_path" 2>/dev/null
-                                dialog --msgbox "Лог скопирован в:\n\n${copy_path}" 8 60
-                                ;;
-                            0) break ;;
-                        esac
+                        dialog --title "Лог установки" --textbox "$LOG_FILE" 36 100 2>/dev/null || break
                     done
                 else
                     dialog --msgbox "Лог недоступен: $LOG_FILE" 8 60
