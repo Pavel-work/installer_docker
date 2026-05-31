@@ -852,7 +852,8 @@ setup_supabase() {
         # Используем tarball GitHub вместо git clone (сломался sparse-checkout)
         if command -v curl &>/dev/null; then
             local _archive="$SETUP_DIR/supabase-docker.tar.gz"
-            if timeout 120 curl -fSLo "$_archive" \
+            # 300 секунд — архив ~230MB на медленном соединении качается 2-3 минуты
+            if timeout 300 curl -fSLo "$_archive" -s \
                 "https://github.com/supabase/supabase/archive/refs/heads/master.tar.gz" >> "$LOG_FILE" 2>&1; then
                 log "Supabase: archive downloaded, extracting docker folder..."
                 mkdir -p "$SETUP_DIR/supabase-tmp"
