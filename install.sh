@@ -2,8 +2,13 @@
 set -uo pipefail
 
 ###############################################################################
-#  Джентльменский набор - установщик сервисов v4.4
+#  Джентльменский набор - установщик сервисов v4.5
 ###############################################################################
+#  Изменения v4.5:
+#    • Полностью переписан порядок запуска: postgres -> БД n8n -> остальные
+#    • start_containers() теперь поэтапный (30с PG + 5с БД + 20с старт)
+#    • n8n больше не падает при запуске с PostgreSQL
+#
 #  Изменения v4.4:
 #    • Увеличены паузы между запусками контейнеров (30с POSTGRES, 20с финал)
 #    • Корректный поэтапный запуск: postgres -> БД -> остальные
@@ -1051,25 +1056,53 @@ YEOF
 ###############################################################################
 start_containers() {
     cd "$SETUP_DIR"
-    dialog --gauge "Запуск контейнеров...                             это может занять какое-то время, сиди не ёрзай!" 8 60 10 &
-    local gp=$!
     local compose_err="$TMP2"
 
-    # Запускаем и сохраняем вывод — без заглушек!
-    if ! docker compose up -d >"$compose_err" 2>&1; then
-        kill "$gp" 2>/dev/null || true
-        log "ERROR: docker compose up failed"
-        cat "$compose_err" >> "$LOG_FILE" 2>/dev/null || true
-        dialog --title "Ошибка при запуске" --textbox "$compose_err" 20 80
-        exit 1
+    # Порядок запуска: если n8n+Postgres — сначала PG, потом БД, потом всё остальное
+    _has_n8n_pg=0
+    if is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" == "1" ]] && is_selected "postgres"; then
+        _has_n8n_pg=1
     fi
-    kill "$gp" 2>/dev/null || true
 
-    # Проверяем что контейнеры действительно запустились
-    dialog --gauge "Проверка контейнеров..." 8 60 80 &
-    gp=$!
-    sleep 3
-    kill "$gp" 2>/dev/null || true
+    if [[ $_has_n8n_pg -eq 1 ]]; then
+        # Шаг 1: запускаем только PostgreSQL
+        dialog --gauge "Шаг 1/3: Запуск PostgreSQL..." 8 60 10
+        docker compose up -d postgres >/dev/null 2>&1
+
+        # Шаг 2: ждём готовности и создаём БД для n8n
+        dialog --gauge "Шаг 2/3: Подготовка БД для n8n..." 8 60 40
+        sleep 30
+        docker exec -e PGPASSWORD="${PGPASSWORD}" postgres \
+            psql -U admin -c "CREATE DATABASE n8n;" >/dev/null 2>&1 || true
+        log "n8n database created (pre-start)"
+        sleep 5
+
+        # Шаг 3: запускаем все остальные контейнеры (n8n уже видит готовую БД)
+        dialog --gauge "Шаг 3/3: Запуск всех контейнеров..." 8 60 70
+        docker compose up -d >/dev/null 2>&1
+        sleep 20
+
+        dialog --gauge "Проверка контейнеров..." 8 60 90
+        sleep 5
+    else
+        # Обычный запуск — без n8n+Postgres
+        dialog --gauge "Запуск контейнеров...                             это может занять какое-то время, сиди не ёрзай!" 8 60 10 &
+        local gp=$!
+
+        if ! docker compose up -d >"$compose_err" 2>&1; then
+            kill "$gp" 2>/dev/null || true
+            log "ERROR: docker compose up failed"
+            cat "$compose_err" >> "$LOG_FILE" 2>/dev/null || true
+            dialog --title "Ошибка при запуске" --textbox "$compose_err" 20 80
+            exit 1
+        fi
+        kill "$gp" 2>/dev/null || true
+
+        dialog --gauge "Проверка контейнеров..." 8 60 80 &
+        gp=$!
+        sleep 3
+        kill "$gp" 2>/dev/null || true
+    fi
 
     local running_count
     running_count=$(docker ps --filter "label=com.docker.compose.project" --format '{{.Names}}' 2>/dev/null | wc -l)
@@ -1080,15 +1113,6 @@ start_containers() {
         exit 1
     fi
     log "Containers started: $running_count running"
-
-    # n8n database
-    if is_selected "n8n" && [[ "${N8N_DB_POSTGRES:-0}" -eq 1 ]] && is_selected "postgres"; then
-        sleep 15
-        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^postgres$'; then
-            docker exec -e PGPASSWORD="${PGPASSWORD}" postgres \
-                psql -U admin -c "CREATE DATABASE n8n;" >/dev/null 2>&1 || true
-        fi
-    fi
     log "Containers started successfully"
 }
 
