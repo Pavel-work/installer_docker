@@ -1036,6 +1036,8 @@ generate_compose_file() {
     # Supabase работает через свой собственный compose файл
     if [[ $_has_compose_svc -eq 0 ]]; then
         log "No compose services selected — skipping docker-compose generation (supabase only)"
+        # Удаляем старый docker-compose.yml если остался с прошлого запуска
+        rm -f "$SETUP_DIR/docker-compose.yml"
         return 0
     fi
 
