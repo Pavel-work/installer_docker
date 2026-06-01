@@ -979,7 +979,8 @@ _supabase_step_up() {
     docker compose -p supabase up -d $services >>"$LOG_FILE" 2>&1
     if [[ -n "$health_container" ]]; then
         sleep 10
-        _supabase_wait_healthy "$health_container" 180 || true
+        _supabase_wait_healthy "$health_container" 180
+        return $?
     else
         sleep 5
     fi
@@ -1020,21 +1021,22 @@ supabase_compose_up() {
     # ═══════════════════════════════════════════════════════════
     #  Поэтапный запуск Supabase в правильном порядке зависимостей:
     #
-    #  Этап 1: db (PostgreSQL)              → ждём healthy
-    #  Этап 2: analytics (Logflare)          → ждём healthy (зависит от db)
-    #  Этап 3: studio (dashboard)            → ждём healthy (зависит от analytics)
-    #  Этап 4: kong (API Gateway)            → ждём healthy (зависит от studio)
-    #  Этап 5: auth, rest, storage, meta,   → параллельно (все зависят только от db)
-    #          realtime, imgproxy, pooler,
-    #          vector, edge-functions, functions
-    # ═══════════════════════════════════════════════════════════
+    #  Этап 1: db (PostgreSQL)                  → ждём healthy
+    #  Этап 2: analytics (Logflare)              → ждём healthy (зависит от db)
+    #  Этап 3: vector                            → ждём healthy (зависит от analytics)
+    #  Этап 4: studio (dashboard)                → ждём healthy (зависит от analytics)
+    #  Этап 5: kong (API Gateway)                → ждём healthy (зависит от studio)
+    #  Этап 6: auth, rest, storage, meta,        → параллельно (все зависят только от db)
+    #          realtime, imgproxy, supavisor,
+    #          functions
+    # ═════════════════════════════════════════════════════════==
     local max_attempts=3 attempt=0
     while [[ $attempt -lt $max_attempts ]]; do
         attempt=$((attempt + 1))
         log "Supabase compose up — stage launch attempt $attempt/$max_attempts"
 
         # --- Этап 1: БД ---
-        _supabase_step_up "db" "1/5 — Запуск PostgreSQL (db)" "supabase-db"
+        _supabase_step_up "db" "1/6 — Запуск PostgreSQL (db)" "supabase-db"
         local db_ok=$?
         # db критична — без неё дальше смысла нет
         if [[ $db_ok -ne 0 ]]; then
@@ -1044,28 +1046,30 @@ supabase_compose_up() {
         fi
 
         # --- Этап 2: Аналитика ---
-        _supabase_step_up "analytics" "2/5 — Запуск аналитики (analytics)" "supabase-analytics"
+        _supabase_step_up "analytics" "2/6 — Запуск аналитики (analytics)" "supabase-analytics"
 
-        # --- Этап 3: Студия (Dashboard) ---
-        _supabase_step_up "studio" "3/5 — Запуск студии (studio)" "supabase-studio"
+        # --- Этап 3: Vector ---
+        _supabase_step_up "vector" "3/6 — Запуск Vector" "supabase-vector"
 
-        # --- Этап 4: Kong (API Gateway) ---
-        _supabase_step_up "kong" "4/5 — Запуск API-шлюза (kong)" "supabase-kong"
+        # --- Этап 4: Студия (Dashboard) ---
+        _supabase_step_up "studio" "4/6 — Запуск студии (studio)" "supabase-studio"
+
+        # --- Этап 5: Kong (API Gateway) ---
+        _supabase_step_up "kong" "5/6 — Запуск API-шлюза (kong)" "supabase-kong"
         local kong_status
         kong_status=$(docker inspect --format '{{.State.Status}}' supabase-kong 2>/dev/null)
         if [[ "$kong_status" != "running" ]]; then
-            log "WARNING: Supabase: kong not running after stage 4 (status=$kong_status), trying docker start..."
+            log "WARNING: Supabase: kong not running after stage 5 (status=$kong_status), trying docker start..."
             docker start supabase-kong >>"$LOG_FILE" 2>&1 || true
             sleep 10
             _supabase_wait_healthy "supabase-kong" 90 || true
         fi
 
-        # --- Этап 5: Остальные сервисы (все зависят от db, но НЕ kong) ---
+        # --- Этап 6: Остальные сервисы (все зависят от db, но НЕ kong) ---
         # Запускаем параллельно — у них нет cross-зависимостей
-        dialog --title "Supabase" --gauge "[ЭТАП] 5/5 — Все остальные сервисы" 8 60 0
+        dialog --title "Supabase" --gauge "[ЭТАП] 6/6 — Все остальные сервисы" 8 60 0
         docker compose -p supabase up -d \
-            auth rest storage meta realtime imgproxy pooler \
-            vector edge-functions functions \
+            auth rest storage meta realtime imgproxy supavisor functions \
             >>"$LOG_FILE" 2>&1 || true
         sleep 30
 
