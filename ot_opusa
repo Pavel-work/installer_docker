@@ -1195,26 +1195,26 @@ supabase_start_staged() {
     stage=1
     info_box "Supabase ($stage/$total_stages)" "Запуск PostgreSQL..." 1
     log "Supabase stage $stage: db"
-    docker compose -p supabase up -d db >>"$LOG_FILE" 2>&1 || return 1
+    docker compose -p supabase $COMPOSE_FILES up -d db >>"$LOG_FILE" 2>&1 || return 1
     supabase_wait_pg_ready supabase-db 120
     supabase_wait_healthy supabase-db 60 || log "  WARN: db not fully healthy, continuing"
 
     stage=2
     info_box "Supabase ($stage/$total_stages)" "Запуск Vector (логи)..." 1
     log "Supabase stage $stage: vector"
-    docker compose -p supabase up -d vector >>"$LOG_FILE" 2>&1 || true
+    docker compose -p supabase $COMPOSE_FILES up -d vector >>"$LOG_FILE" 2>&1 || true
     supabase_wait_healthy supabase-vector 60 || log "  WARN: vector slow"
 
     stage=3
     info_box "Supabase ($stage/$total_stages)" "Запуск аналитики (Logflare)..." 1
     log "Supabase stage $stage: analytics"
-    docker compose -p supabase up -d analytics >>"$LOG_FILE" 2>&1 || true
+    docker compose -p supabase $COMPOSE_FILES up -d analytics >>"$LOG_FILE" 2>&1 || true
     supabase_wait_healthy supabase-analytics 120 || log "  WARN: analytics slow"
 
     stage=4
     info_box "Supabase ($stage/$total_stages)" "Запуск сервисов БД..." 1
     log "Supabase stage $stage: meta/auth/rest/storage/realtime/functions/imgproxy/supavisor"
-    docker compose -p supabase up -d \
+    docker compose -p supabase $COMPOSE_FILES up -d \
         meta auth rest storage realtime functions imgproxy supavisor \
         >>"$LOG_FILE" 2>&1 || true
     sleep 10
@@ -1226,13 +1226,13 @@ supabase_start_staged() {
     stage=5
     info_box "Supabase ($stage/$total_stages)" "Запуск API Gateway (Kong)..." 1
     log "Supabase stage $stage: kong"
-    docker compose -p supabase up -d kong >>"$LOG_FILE" 2>&1 || true
+    docker compose -p supabase $COMPOSE_FILES up -d kong >>"$LOG_FILE" 2>&1 || true
     supabase_wait_healthy supabase-kong 60 || log "  WARN: kong slow"
 
     stage=6
     info_box "Supabase ($stage/$total_stages)" "Запуск Studio (UI)..." 1
     log "Supabase stage $stage: studio"
-    docker compose -p supabase up -d studio >>"$LOG_FILE" 2>&1 || true
+    docker compose -p supabase $COMPOSE_FILES up -d studio >>"$LOG_FILE" 2>&1 || true
     supabase_wait_healthy supabase-studio 90 || log "  WARN: studio slow"
 
     info_box "Supabase" "Стабилизация (15 сек)..." 1
@@ -1243,6 +1243,10 @@ supabase_start_staged() {
 supabase_connect_network() {
     local c
     docker ps --filter "name=supabase-" --format "{{.Names}}" 2>/dev/null \
+    | while IFS= read -r c; do
+        docker network connect internal_network "$c" 2>/dev/null || true
+    done
+    docker ps --filter "name=realtime-dev" --format "{{.Names}}" 2>/dev/null \
     | while IFS= read -r c; do
         docker network connect internal_network "$c" 2>/dev/null || true
     done
@@ -1280,17 +1284,72 @@ setup_supabase() {
 
     cd supabase-docker || { popd >/dev/null; return 1; }
 
-    cat > docker-compose.override.yml <<'OVR'
+    # --- Override: realtime healthcheck + published ports ---
+    # Создаём новый override впервые, или обновляем существующий
+    # (добавляем отсутствующие секции, чтобы при обновлении скрипта
+    #  новые фичи тоже применялись к старой установке)
+    if [[ ! -f docker-compose.override.yml ]]; then
+        cat > docker-compose.override.yml <<OVERRIDE_EOF
 services:
   realtime:
     healthcheck:
-      test: ["CMD-SHELL", "curl -sSfL --head -o /dev/null http://localhost:4000/ || exit 1"]
+      test: "curl -sSfL --head -o /dev/null http://localhost:4000/ || exit 1"
       interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-OVR
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+  studio:
+    ports:
+      - "${SUPABASE_PORT_STUDIO}:3000"
+  db:
+    ports:
+      - "${SUPABASE_PORT_PG}:5432"
+  kong:
+    ports:
+      - "${SUPABASE_PORT_API}:8000"
+      - "8443:8443"
+  edge-functions:
+    command:
+      - sh
+      - -c
+      - |
+        deno cache --reload /home/deno/function/index.ts && deno run --allow-all --unstable-sloppy-imports /home/deno/main.ts
+OVERRIDE_EOF
+        log "Supabase: override created"
+    else
+        # Обновляем существующий override — добавляем отсутствующие ��екции
+        local ovf="docker-compose.override.yml"
+        if ! grep -q 'healthcheck:' "$ovf" 2>/dev/null; then
+            # Добавляем realtime healthcheck перед первым 'studio:' или в начало services
+            local tmp_ovf
+            tmp_ovf=$(_mktemp)
+            sed '/^  studio:/i\  realtime:\n    healthcheck:\n      test: "curl -sSfL --head -o /dev/null http://localhost:4000/ || exit 1"\n      interval: 30s\n      timeout: 5s\n      retries: 3\n      start_period: 10s' "$ovf" > "$tmp_ovf"
+            mv "$tmp_ovf" "$ovf"
+            log "Supabase: injected realtime healthcheck into override"
+        fi
+        if ! grep -q 'studio:' "$ovf" 2>/dev/null; then
+            printf '\n  studio:\n    ports:\n      - "%s:3000"\n' "${SUPABASE_PORT_STUDIO}" >> "$ovf"
+            log "Supabase: injected studio ports into override"
+        fi
+        if ! grep -q 'db:' "$ovf" 2>/dev/null; then
+            printf '\n  db:\n    ports:\n      - "%s:5432"\n' "${SUPABASE_PORT_PG}" >> "$ovf"
+            log "Supabase: injected db ports into override"
+        fi
+        if ! grep -q 'edge-functions:' "$ovf" 2>/dev/null; then
+            printf '\n  edge-functions:\n    command:\n      - sh\n      - -c\n      - |\n        deno cache --reload /home/deno/function/index.ts && deno run --allow-all --unstable-sloppy-imports /home/deno/main.ts\n' >> "$ovf"
+            log "Supabase: injected edge-functions fix into override"
+        fi
+        log "Supabase: override updated/verified"
+    fi
 
+    # Композ-файлы для всех вызовов docker compose
+    COMPOSE_FILES="-f docker-compose.yml"
+    if [[ -f docker-compose.override.yml ]]; then
+        COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.override.yml"
+    fi
+    log "Supabase: compose files: $COMPOSE_FILES"
+
+    # Определяем: новая установка или обновление
     local is_new=0
     if [[ ! -f .env ]] || ! grep -q "^ANON_KEY=" .env 2>/dev/null; then
         is_new=1
@@ -1334,12 +1393,12 @@ OVR
 
     info_box "Supabase" "Скачивание образов (5-15 мин)..." 1
     log "Supabase: docker compose pull..."
-    docker compose -p supabase pull >>"$LOG_FILE" 2>&1 || \
+    docker compose -p supabase $COMPOSE_FILES pull >>"$LOG_FILE" 2>&1 || \
         log "WARN: some images failed to pull, will retry on up"
 
     if [[ $is_new -eq 0 ]]; then
-        log "Supabase: existing installation — restarting"
-        docker compose -p supabase down >>"$LOG_FILE" 2>&1 || true
+        log "Supabase: existing installation — restart containers only"
+        docker compose -p supabase $COMPOSE_FILES down >>"$LOG_FILE" 2>&1 || true
         sleep 3
     fi
 
@@ -1779,7 +1838,7 @@ reinstall_service() {
             dialog --yes-label "Удалить ВСЕ" --no-label "Отмена" \
                 --yesno "Переустановить Supabase?\n\nВСЕ ДАННЫЕ БУДУТ УДАЛЕНЫ!\nСделайте backup заранее." 9 60 \
                 || return 0
-            docker compose -p supabase down -v >>"$LOG_FILE" 2>&1 || true
+            (cd "$SETUP_DIR/supabase-docker" && docker compose -p supabase -f docker-compose.yml -f docker-compose.override.yml down -v) >>"$LOG_FILE" 2>&1 || true
             rm -rf supabase-docker
             setup_supabase
             ;;
@@ -1884,7 +1943,7 @@ post_install_menu() {
                     --yesno "ПОЛНЫЙ СБРОС.\n\nБудет удалено:\n  • $STATE_DIR\n  • $SETUP_DIR\n  • Все контейнеры (с томами!)" 11 60 \
                     || continue
                 (cd "$SETUP_DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true)
-                (cd "$SETUP_DIR/supabase-docker" 2>/dev/null && docker compose -p supabase down -v 2>/dev/null || true)
+                (cd "$SETUP_DIR/supabase-docker" 2>/dev/null && docker compose -p supabase -f docker-compose.yml -f docker-compose.override.yml down -v 2>/dev/null || true)
                 rm -rf "$STATE_DIR" "$SETUP_DIR"
                 info_box "Готово" "Сброшено. Перезапуск..." 2
                 exec "$0"
