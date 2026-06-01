@@ -1,0 +1,1978 @@
+#!/bin/bash
+set -uo pipefail
+###############################################################################
+#  Джентльменский набор — установщик сервисов v5.1
+#  Полный объединённый скрипт
+###############################################################################
+
+readonly STATE_DIR="/root/.server-setup-state"
+readonly STATE_FILE="$STATE_DIR/state.cfg"
+readonly SELECTED_FILE="$STATE_DIR/selected_services.cfg"
+readonly PARAMS_FILE="$STATE_DIR/params.env"
+readonly SETUP_DIR="/root/server-setup"
+readonly LOG_FILE="/var/log/install.log"
+readonly REAL_USER="${SUDO_USER:-${USER:-root}}"
+
+readonly DLG_H=22
+readonly DLG_W=72
+
+declare -a SELECTED_ARRAY=()
+declare -a _MKTEMPS=()
+
+mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null || true
+touch "$LOG_FILE" 2>/dev/null || true
+
+TMP=$(mktemp); _MKTEMPS+=("$TMP")
+TMP2=$(mktemp); _MKTEMPS+=("$TMP2")
+
+_mktemp() {
+    local f
+    f=$(mktemp "$@")
+    _MKTEMPS+=("$f")
+    printf '%s' "$f"
+}
+
+cleanup() {
+    local f
+    for f in "${_MKTEMPS[@]+"${_MKTEMPS[@]}"}"; do
+        rm -f "$f" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT INT TERM
+
+log() {
+    printf '%s  %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+log_section() {
+    log "========================================================"
+    log "  $*"
+    log "========================================================"
+}
+
+env_esc() {
+    local v="${1:-}"
+    local bt='`'
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//\$/\\\$}"
+    v="${v//$bt/\\$bt}"
+    v="${v//$'\n'/\\n}"
+    printf '"%s"' "$v"
+}
+
+yaml_sq_esc() {
+    local v="${1:-}"
+    v="${v//\'/\'\'}"
+    printf '%s' "$v"
+}
+
+compose_esc() {
+    local v="${1:-}"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '%s' "$v"
+}
+
+inject_env() {
+    local file="$1" key="$2" value="$3"
+    local tmp found=0
+    [[ ! -f "$file" ]] && touch "$file"
+    tmp=$(_mktemp)
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "${key}="* ]]; then
+            printf '%s=%s\n' "$key" "$value"
+            found=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$file" > "$tmp"
+    [[ $found -eq 0 ]] && printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    mv "$tmp" "$file"
+}
+
+b64enc() {
+    [[ -z "${1:-}" ]] && { printf ''; return 0; }
+    local r
+    if r=$(printf '%s' "$1" | base64 -w0 2>/dev/null) && [[ -n "$r" ]]; then
+        printf '%s' "$r"
+    elif r=$(printf '%s' "$1" | base64 2>/dev/null | tr -d '\n'); then
+        printf '%s' "$r"
+    else
+        printf ''
+    fi
+}
+
+b64dec() {
+    [[ -z "${1:-}" ]] && { printf ''; return 0; }
+    printf '%s' "$1" | base64 -d 2>/dev/null || printf ''
+}
+
+load_param_b64() {
+    local file="$1" key="$2"
+    local line val
+    line=$(grep "^${key}=" "$file" 2>/dev/null | head -n1) || line=""
+    [[ -z "$line" ]] && return 1
+    val="${line#*=}"
+    val="${val#\"}"; val="${val%\"}"
+    val="${val#\'}"; val="${val%\'}"
+    printf '%s' "$val"
+}
+
+port_in_use() {
+    local port="$1"
+    if command -v ss &>/dev/null; then
+        ss -tuln 2>/dev/null | grep -qE ":${port}\b"
+    elif command -v netstat &>/dev/null; then
+        netstat -tuln 2>/dev/null | grep -qE ":${port}\b"
+    else
+        (echo >/dev/tcp/127.0.0.1/${port}) 2>/dev/null
+    fi
+}
+
+check_port() {
+    local port="$1"
+    if port_in_use "$port"; then
+        if dialog --title "Порт занят" \
+            --yes-label "Другой порт" --no-label "Пропустить" \
+            --yesno "Порт $port уже используется.\nПопробовать другой?" 8 55; then
+            return 1
+        fi
+    fi
+    return 0
+}
+
+is_selected() {
+    local s
+    for s in "${SELECTED_ARRAY[@]+"${SELECTED_ARRAY[@]}"}"; do
+        [[ "$s" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+save_state() { printf '%s' "$1" >"$STATE_FILE"; }
+get_state()  { [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || echo "start"; }
+
+save_selected_services() {
+    if [[ ${#SELECTED_ARRAY[@]} -gt 0 ]]; then
+        printf '%s\n' "${SELECTED_ARRAY[@]}" >"$SELECTED_FILE"
+    else
+        : >"$SELECTED_FILE"
+    fi
+}
+
+load_selected_services() {
+    SELECTED_ARRAY=()
+    [[ ! -s "$SELECTED_FILE" ]] && return 0
+    mapfile -t SELECTED_ARRAY < "$SELECTED_FILE"
+    local c=() i
+    for i in "${SELECTED_ARRAY[@]+"${SELECTED_ARRAY[@]}"}"; do
+        i="${i//\"/}"; i="${i// /}"; i="${i//$'\r'/}"
+        [[ -n "$i" ]] && c+=("$i")
+    done
+    SELECTED_ARRAY=("${c[@]+"${c[@]}"}")
+}
+
+declare -A _PM=(
+    [PGPASSWORD]="PGPASSWORD_B64"
+    [JWT_SECRET]="JWT_SECRET_B64"
+    [LLM_TYPE]="LLM_TYPE_B64"
+    [LLM_API_KEY]="LLM_API_KEY_B64"
+    [LLM_API_URL]="LLM_API_URL_B64"
+    [DOMAIN]="DOMAIN_B64"
+    [DOMAIN_HTTPS]="DOMAIN_HTTPS_B64"
+    [SUPABASE_DOMAIN]="SUPABASE_DOMAIN_B64"
+    [SUPABASE_HTTPS]="SUPABASE_HTTPS_B64"
+    [N8N_PORT]="N8N_PORT_B64"
+    [N8N_DB_POSTGRES]="N8N_DB_POSTGRES_B64"
+    [APACHE_WWW_PATH]="APACHE_WWW_PATH_B64"
+    [APACHE_HTTP_PORT]="APACHE_HTTP_PORT_B64"
+    [QDRANT_PORT]="QDRANT_PORT_B64"
+    [PORTAINER_PORT]="PORTAINER_PORT_B64"
+    [OLLAMA_PORT]="OLLAMA_PORT_B64"
+    [SUPABASE_PORT_STUDIO]="SUPABASE_PORT_STUDIO_B64"
+    [SUPABASE_PORT_PG]="SUPABASE_PORT_PG_B64"
+    [SUPABASE_PORT_API]="SUPABASE_PORT_API_B64"
+    [SUPABASE_PORT_POOLER]="SUPABASE_PORT_POOLER_B64"
+    [CLOUDFLARE_MODE]="CLOUDFLARE_MODE_B64"
+    [CLOUDFLARE_TOKEN]="CLOUDFLARE_TOKEN_B64"
+    [CLOUDFLARE_TUNNEL_ID]="CLOUDFLARE_TUNNEL_ID_B64"
+    [CLOUDFLARE_TUNNEL_NAME]="CLOUDFLARE_TUNNEL_NAME_B64"
+    [CLOUDFLARE_ACCOUNT_TAG]="CLOUDFLARE_ACCOUNT_TAG_B64"
+    [CLOUDFLARE_TUNNEL_SECRET]="CLOUDFLARE_TUNNEL_SECRET_B64"
+    [CLOUDFLARE_DOMAIN]="CLOUDFLARE_DOMAIN_B64"
+    [CLOUDFLARE_ROUTES]="CLOUDFLARE_ROUTES_B64"
+)
+
+save_params() {
+    local f="$PARAMS_FILE.tmp"
+    {
+        local k
+        for k in "${!_PM[@]}"; do
+            printf '%s="%s"\n' "${_PM[$k]}" "$(b64enc "${!k:-}")"
+        done
+    } > "$f"
+    mv "$f" "$PARAMS_FILE"
+    chmod 600 "$PARAMS_FILE"
+}
+
+load_params() {
+    PGPASSWORD=""
+    JWT_SECRET=""
+    LLM_TYPE="ollama"
+    LLM_API_KEY=""
+    LLM_API_URL="http://ollama:11434"
+    DOMAIN=""
+    DOMAIN_HTTPS=0
+    SUPABASE_DOMAIN=""
+    SUPABASE_HTTPS=0
+    N8N_PORT=5678
+    N8N_DB_POSTGRES=0
+    APACHE_WWW_PATH="$SETUP_DIR/www"
+    APACHE_HTTP_PORT=8080
+    QDRANT_PORT=6333
+    PORTAINER_PORT=9000
+    OLLAMA_PORT=11434
+    SUPABASE_PORT_STUDIO=3000
+    SUPABASE_PORT_PG=5432
+    SUPABASE_PORT_API=8000
+    SUPABASE_PORT_POOLER=6543
+    CLOUDFLARE_MODE=""
+    CLOUDFLARE_TOKEN=""
+    CLOUDFLARE_TUNNEL_ID=""
+    CLOUDFLARE_TUNNEL_NAME=""
+    CLOUDFLARE_ACCOUNT_TAG=""
+    CLOUDFLARE_TUNNEL_SECRET=""
+    CLOUDFLARE_DOMAIN=""
+    CLOUDFLARE_ROUTES=""
+
+    if [[ -f "$PARAMS_FILE" ]]; then
+        local k b t
+        for k in "${!_PM[@]}"; do
+            if b=$(load_param_b64 "$PARAMS_FILE" "${_PM[$k]}"); then
+                t=$(b64dec "$b")
+                [[ -n "$t" ]] && printf -v "$k" "%s" "$t"
+            fi
+        done
+    fi
+
+    [[ "$N8N_PORT"             =~ ^[0-9]+$ ]] || N8N_PORT=5678
+    [[ "$APACHE_HTTP_PORT"     =~ ^[0-9]+$ ]] || APACHE_HTTP_PORT=8080
+    [[ "$QDRANT_PORT"          =~ ^[0-9]+$ ]] || QDRANT_PORT=6333
+    [[ "$PORTAINER_PORT"       =~ ^[0-9]+$ ]] || PORTAINER_PORT=9000
+    [[ "$OLLAMA_PORT"          =~ ^[0-9]+$ ]] || OLLAMA_PORT=11434
+    [[ "$N8N_DB_POSTGRES"      =~ ^[01]$   ]] || N8N_DB_POSTGRES=0
+    [[ "$DOMAIN_HTTPS"         =~ ^[01]$   ]] || DOMAIN_HTTPS=0
+    [[ "$SUPABASE_HTTPS"       =~ ^[01]$   ]] || SUPABASE_HTTPS=0
+    [[ "$SUPABASE_PORT_STUDIO" =~ ^[0-9]+$ ]] || SUPABASE_PORT_STUDIO=3000
+    [[ "$SUPABASE_PORT_PG"     =~ ^[0-9]+$ ]] || SUPABASE_PORT_PG=5432
+    [[ "$SUPABASE_PORT_API"    =~ ^[0-9]+$ ]] || SUPABASE_PORT_API=8000
+    [[ "$SUPABASE_PORT_POOLER" =~ ^[0-9]+$ ]] || SUPABASE_PORT_POOLER=6543
+    [[ "$CLOUDFLARE_MODE" == "token" || "$CLOUDFLARE_MODE" == "config" ]] || CLOUDFLARE_MODE=""
+}
+
+run_with_progress() {
+    local title="$1" desc="$2"; shift 2
+    local logmark="/tmp/.progress_$$_$RANDOM"
+    (
+        "$@" >>"$LOG_FILE" 2>&1
+        echo $? > "$logmark"
+    ) &
+    local cmd_pid=$!
+
+    local pct=0
+    (
+        while kill -0 "$cmd_pid" 2>/dev/null; do
+            echo "$pct"
+            echo "XXX"
+            echo "$desc"
+            echo "XXX"
+            pct=$((pct + 3))
+            [[ $pct -gt 95 ]] && pct=95
+            sleep 1
+        done
+        echo "100"
+    ) | dialog --title "$title" --gauge "$desc" 9 70 0
+
+    wait "$cmd_pid" 2>/dev/null || true
+    local rc=0
+    [[ -f "$logmark" ]] && rc=$(<"$logmark") && rm -f "$logmark"
+    return "$rc"
+}
+
+info_box() {
+    local title="$1" msg="$2" sec="${3:-2}"
+    dialog --title "$title" --infobox "$msg" 7 60
+    sleep "$sec"
+}
+
+_nav_action="next"
+_STEP=0
+_STEP_MAX=0
+_STEP_LABELS=()
+_STEP_FUNC=()
+
+step_reg() { _STEP_LABELS+=("$1"); _STEP_FUNC+=("$2"); }
+
+build_steps() {
+    _STEP_LABELS=()
+    _STEP_FUNC=()
+    _STEP=0
+    is_selected "postgres"    && step_reg "PostgreSQL пароль"   "s_pg"
+    is_selected "ollama"      && step_reg "LLM Provider"        "s_llm"
+    if is_selected "apache" || is_selected "n8n" || \
+       is_selected "nginx_proxy" || is_selected "supabase"; then
+        step_reg "Домен"                                        "s_domain"
+    fi
+    is_selected "n8n"         && step_reg "n8n порт"            "s_n8n_port"
+    is_selected "n8n" && is_selected "postgres" && \
+        step_reg "n8n: Postgres или SQLite?"                    "s_n8n_db"
+    is_selected "supabase"    && step_reg "Supabase поддомен"   "s_supabase_domain"
+    is_selected "supabase"    && step_reg "JWT Secret"          "s_jwt"
+    is_selected "supabase"    && step_reg "Supabase порты"      "s_supabase_ports"
+    is_selected "apache"      && step_reg "Apache путь"         "s_ap_path"
+    is_selected "apache"      && step_reg "Apache порт"         "s_ap_port"
+    is_selected "qdrant"      && step_reg "Qdrant порт"         "s_qdrant_port"
+    is_selected "portainer"   && step_reg "Portainer порт"      "s_portainer_port"
+    is_selected "ollama"      && step_reg "Ollama порт"         "s_ollama_port"
+    is_selected "cloudflared" && step_reg "Cloudflare режим"    "s_cf_mode"
+    is_selected "cloudflared" && step_reg "Cloudflare данные"   "s_cf_creds"
+    is_selected "cloudflared" && step_reg "Cloudflare маршруты" "s_cf_routes"
+    step_reg "Подтверждение"                                    "s_confirm"
+    _STEP_MAX=${#_STEP_LABELS[@]}
+}
+
+input_port() {
+    local label="$1" varname="$2" default_port="$3"
+    while true; do
+        local default_val="${!varname:-$default_port}"
+        dialog --ok-label "Далее" --cancel-label "Назад" \
+            --title "Порт $label" \
+            --inputbox "Укажите порт для $label:" 8 60 "$default_val" 2>"$TMP" \
+            || { _nav_action="back"; return 1; }
+        local val
+        val=$(<"$TMP")
+        if [[ "$val" =~ ^[0-9]+$ ]] && [[ $val -ge 1 ]] && [[ $val -le 65535 ]]; then
+            printf -v "$varname" "%s" "$val"
+        else
+            printf -v "$varname" "%s" "$default_port"
+        fi
+        check_port "${!varname}" && return 0
+    done
+}
+
+s_pg() {
+    dialog --ok-label "Далее" --cancel-label "Назад" \
+        --title "[$((_STEP+1))/${_STEP_MAX}] PostgreSQL" \
+        --inputbox "Пароль admin (пусто = сгенерировать)" \
+        10 65 "${PGPASSWORD:-}" 2>"$TMP" \
+        || { _nav_action="back"; return 1; }
+    PGPASSWORD=$(<"$TMP")
+    [[ -z "$PGPASSWORD" ]] && \
+        PGPASSWORD=$(openssl rand -base64 24 | tr -d '+=/' | cut -c1-24)
+    dialog --title "PostgreSQL пароль установлен" --ok-label "Далее" \
+        --msgbox "Сохраните пароль:\n\n${PGPASSWORD}\n\n(виден также в ${PARAMS_FILE})" 11 65
+}
+
+s_llm() {
+    LLM_TYPE=$(dialog --ok-label "Далее" --cancel-label "Назад" \
+        --title "[$((_STEP+1))/${_STEP_MAX}] LLM Provider" \
+        --radiolist "Выберите LLM провайдер:" 15 60 5 \
+        "ollama"    "Ollama (локально)"    on \
+        "openai"    "OpenAI"               off \
+        "anthropic" "Anthropic Claude"     off \
+        "deepseek"  "DeepSeek"             off \
+        "custom"    "Custom URL"           off \
+        3>&1 1>&2 2>&3) || { _nav_action="back"; return 1; }
+    case "$LLM_TYPE" in
+        openai)    LLM_API_URL="https://api.openai.com/v1" ;;
+        anthropic) LLM_API_URL="https://api.anthropic.com/v1" ;;
+        ollama)    LLM_API_URL="http://ollama:11434"; LLM_API_KEY="" ;;
+        deepseek)  LLM_API_URL="https://api.deepseek.com/v1" ;;
+        custom)
+            dialog --ok-label "Далее" --cancel-label "Назад" \
+                --inputbox "Введите URL API:" 9 60 "${LLM_API_URL:-}" 2>"$TMP" \
+                || { _nav_action="back"; return 1; }
+            LLM_API_URL=$(<"$TMP")
+            ;;
+    esac
+    if [[ "$LLM_TYPE" != "ollama" ]]; then
+        dialog --ok-label "Далее" --cancel-label "Назад" \
+            --inputbox "API ключ для ${LLM_TYPE}:" 9 60 "${LLM_API_KEY:-}" 2>"$TMP" \
+            || { _nav_action="back"; return 1; }
+        LLM_API_KEY=$(<"$TMP")
+    fi
+}
+
+s_domain() {
+    dialog --ok-label "Далее" --cancel-label "Назад" \
+        --title "Домен" \
+        --inputbox "Основной домен (пусто если нет):\n\nПример: example.com" \
+        9 60 "${DOMAIN:-}" 2>"$TMP" \
+        || { _nav_action="back"; return 1; }
+    DOMAIN=$(<"$TMP")
+    if [[ -n "$DOMAIN" ]]; then
+        if dialog --title "HTTPS" \
+            --yes-label "Да (HTTPS)" --no-label "Нет (HTTP)" \
+            --yesno "Доступ к домену по HTTPS?\n\n(Да — если настроен SSL через NPM/Cloudflare)" 8 60; then
+            DOMAIN_HTTPS=1
+        else
+            DOMAIN_HTTPS=0
+        fi
+    else
+        DOMAIN_HTTPS=0
+    fi
+}
+
+s_n8n_port() { input_port "n8n" N8N_PORT 5678; }
+
+s_n8n_db() {
+    if dialog --yes-label "PostgreSQL" --no-label "SQLite" \
+        --title "n8n База данных" \
+        --yesno "Какую БД использовать для n8n?\n\nДа = PostgreSQL (рекомендуется)\nНет = SQLite" 9 60; then
+        N8N_DB_POSTGRES=1
+    else
+        N8N_DB_POSTGRES=0
+    fi
+    _nav_action="next"
+}
+
+s_supabase_domain() {
+    dialog --ok-label "Далее" --cancel-label "Назад" \
+        --inputbox "Поддомен Supabase (пусто если нет):\n\nПример: supabase.example.com" \
+        9 60 "${SUPABASE_DOMAIN:-}" 2>"$TMP" \
+        || { _nav_action="back"; return 1; }
+    SUPABASE_DOMAIN=$(<"$TMP")
+    if [[ -n "$SUPABASE_DOMAIN" ]]; then
+        if dialog --yes-label "Да" --no-label "Нет" \
+            --yesno "Supabase доступен по HTTPS?" 7 50; then
+            SUPABASE_HTTPS=1
+        else
+            SUPABASE_HTTPS=0
+        fi
+    else
+        SUPABASE_HTTPS=0
+    fi
+}
+
+s_jwt() {
+    dialog --ok-label "Далее" --cancel-label "Назад" \
+        --title "JWT Secret" \
+        --inputbox "Секрет JWT (пусто = сгенерировать; ≥32 симв.)" \
+        9 65 "${JWT_SECRET:-}" 2>"$TMP" \
+        || { _nav_action="back"; return 1; }
+    JWT_SECRET=$(<"$TMP")
+    if [[ -z "$JWT_SECRET" ]] || [[ ${#JWT_SECRET} -lt 32 ]]; then
+        JWT_SECRET=$(openssl rand -hex 32)
+    fi
+    dialog --title "JWT Secret установлен" --ok-label "Далее" \
+        --msgbox "JWT Secret:\n\n${JWT_SECRET}\n\nСохранён в ${PARAMS_FILE}" 11 75
+}
+
+s_supabase_ports() {
+    while true; do
+        local _sf
+        _sf=$(_mktemp)
+        {
+            printf 'Порты Supabase (внешние):\n\n'
+            printf '  Studio (Dashboard)  : %s\n' "$SUPABASE_PORT_STUDIO"
+            printf '  Database (PostgreSQL): %s\n' "$SUPABASE_PORT_PG"
+            printf '  API Gateway (Kong)  : %s\n' "$SUPABASE_PORT_API"
+            printf '  Pooler (Supavisor)  : %s\n' "$SUPABASE_PORT_POOLER"
+            printf '\nИспользуйте Database порт для подключения n8n:\n'
+            printf '  host=<IP> port=%s user=postgres\n' "$SUPABASE_PORT_PG"
+        } > "$_sf"
+        if dialog --title "Supabase порты" \
+            --yes-label "Далее" --no-label "Изменить" \
+            --yesno "$(cat "$_sf")" 18 60; then
+            _nav_action="next"
+            return 0
+        fi
+
+        local _cancelled=0
+        local pv label dv
+        for pv in SUPABASE_PORT_STUDIO SUPABASE_PORT_PG SUPABASE_PORT_API SUPABASE_PORT_POOLER; do
+            case "$pv" in
+                SUPABASE_PORT_STUDIO) label="Studio"   ; dv=3000 ;;
+                SUPABASE_PORT_PG)     label="Database" ; dv=5432 ;;
+                SUPABASE_PORT_API)    label="API/Kong" ; dv=8000 ;;
+                SUPABASE_PORT_POOLER) label="Pooler"   ; dv=6543 ;;
+            esac
+            dialog --ok-label "OK" --cancel-label "Назад" \
+                --inputbox "Порт ${label} (по умолч. ${dv}):" \
+                8 55 "${!pv}" 2>"$TMP" \
+                || { _cancelled=1; break; }
+            local val
+            val=$(<"$TMP")
+            if [[ "$val" =~ ^[0-9]+$ ]] && [[ $val -ge 1 ]] && [[ $val -le 65535 ]]; then
+                printf -v "$pv" "%s" "$val"
+            fi
+        done
+
+        if [[ $_cancelled -eq 1 ]]; then
+            _nav_action="back"
+            return 1
+        fi
+    done
+}
+
+s_ap_path() {
+    dialog --ok-label "Далее" --cancel-label "Назад" \
+        --inputbox "Путь для сайтов Apache:" 9 60 \
+        "${APACHE_WWW_PATH:-$SETUP_DIR/www}" 2>"$TMP" \
+        || { _nav_action="back"; return 1; }
+    APACHE_WWW_PATH=$(<"$TMP")
+    [[ -z "$APACHE_WWW_PATH" ]] && APACHE_WWW_PATH="$SETUP_DIR/www"
+    APACHE_WWW_PATH=$(realpath -m "$APACHE_WWW_PATH")
+    mkdir -p "$APACHE_WWW_PATH" "$APACHE_WWW_PATH/conf"
+    [[ ! -f "$APACHE_WWW_PATH/index.html" ]] && \
+        echo '<h1>It works!</h1>' >"$APACHE_WWW_PATH/index.html"
+}
+
+s_ap_port()        { input_port "Apache"    APACHE_HTTP_PORT 8080;  }
+s_qdrant_port()    { input_port "Qdrant"    QDRANT_PORT      6333;  }
+s_portainer_port() { input_port "Portainer" PORTAINER_PORT   9000;  }
+s_ollama_port()    { input_port "Ollama"    OLLAMA_PORT      11434; }
+s_cf_mode() {
+    while true; do
+        local choice rc
+        choice=$(dialog --title "Cloudflare Tunnel — режим" \
+            --ok-label "Далее" --cancel-label "Назад" \
+            --extra-button --extra-label "Помощь" \
+            --menu "Выберите способ настройки тоннеля:" 14 70 2 \
+            "token"  "Токен из dashboard (просто)" \
+            "config" "Tunnel ID + creds (продвинуто)" \
+            3>&1 1>&2 2>&3)
+        rc=$?
+        case $rc in
+            0)
+                CLOUDFLARE_MODE="$choice"
+                _nav_action="next"
+                return 0
+                ;;
+            1|255)
+                _nav_action="back"
+                return 1
+                ;;
+            3)
+                dialog --title "Создание тоннеля" --msgbox \
+"СПОСОБ 1 — ТОКЕН (просто):
+
+1. Откройте https://one.dash.cloudflare.com
+2. Networks → Tunnels → Create a tunnel
+3. Выберите 'Cloudflared'
+4. Назовите тоннель
+5. На экране 'Install connector' скопируйте
+   ДЛИННУЮ строку после 'cloudflared service install'
+   (начинается на 'eyJ...', ~180+ символов)
+6. Вставьте её на следующем шаге
+7. Маршруты (Public Hostnames) добавьте
+   в dashboard после установки
+
+СПОСОБ 2 — КОНФИГ:
+
+Требует: Tunnel ID + Account Tag + Tunnel Secret
+Получить можно через:
+  cloudflared tunnel login
+  cloudflared tunnel create <name>
+Файл credentials.json будет в ~/.cloudflared/
+Откройте его — там нужные поля." 25 70
+                ;;
+        esac
+    done
+}
+
+s_cf_creds() {
+    if [[ "$CLOUDFLARE_MODE" == "token" ]]; then
+        while true; do
+            dialog --ok-label "Далее" --cancel-label "Назад" \
+                --title "Cloudflare токен" \
+                --inputbox "Вставьте токен (eyJ...):\n\n(длинная строка ~180+ симв.)" \
+                11 70 "${CLOUDFLARE_TOKEN:-}" 2>"$TMP" \
+                || { _nav_action="back"; return 1; }
+            CLOUDFLARE_TOKEN=$(<"$TMP")
+            if [[ -z "$CLOUDFLARE_TOKEN" ]] || [[ ${#CLOUDFLARE_TOKEN} -lt 50 ]]; then
+                dialog --msgbox "Токен слишком короткий или пустой.\nДолжен начинаться с 'eyJ' и быть ~180+ симв." 8 60
+                continue
+            fi
+            if [[ ! "$CLOUDFLARE_TOKEN" =~ ^eyJ ]]; then
+                if ! dialog --yes-label "Всё равно использовать" \
+                    --no-label "Ввести заново" \
+                    --yesno "Токен обычно начинается с 'eyJ'.\nВаш — нет. Продолжить?" 8 55; then
+                    continue
+                fi
+            fi
+            break
+        done
+    else
+        while true; do
+            dialog --ok-label "Далее" --cancel-label "Назад" \
+                --title "Cloudflare config" \
+                --form "Заполните данные тоннеля:" 14 72 4 \
+                "Tunnel ID:"     1 1 "${CLOUDFLARE_TUNNEL_ID:-}"      1 18 48 0 \
+                "Tunnel Name:"   2 1 "${CLOUDFLARE_TUNNEL_NAME:-}"    2 18 48 0 \
+                "Account Tag:"   3 1 "${CLOUDFLARE_ACCOUNT_TAG:-}"    3 18 48 0 \
+                "Tunnel Secret:" 4 1 "${CLOUDFLARE_TUNNEL_SECRET:-}"  4 18 48 0 \
+                2>"$TMP" \
+                || { _nav_action="back"; return 1; }
+            local lines=()
+            mapfile -t lines <"$TMP"
+            CLOUDFLARE_TUNNEL_ID="${lines[0]:-}"
+            CLOUDFLARE_TUNNEL_NAME="${lines[1]:-}"
+            CLOUDFLARE_ACCOUNT_TAG="${lines[2]:-}"
+            CLOUDFLARE_TUNNEL_SECRET="${lines[3]:-}"
+            if [[ -z "$CLOUDFLARE_TUNNEL_ID" ]] || [[ -z "$CLOUDFLARE_ACCOUNT_TAG" ]] \
+               || [[ -z "$CLOUDFLARE_TUNNEL_SECRET" ]]; then
+                dialog --msgbox "Заполните все обязательные поля:\nTunnel ID, Account Tag, Secret." 8 55
+                continue
+            fi
+            break
+        done
+    fi
+
+    dialog --ok-label "Далее" --cancel-label "Назад" \
+        --title "Базовый домен Cloudflare" \
+        --inputbox "Ваш домен в Cloudflare (например, example.com):\n\nНа его основе строятся поддомены\n(n8n.example.com, portainer.example.com и т.д.)" \
+        12 65 "${CLOUDFLARE_DOMAIN:-}" 2>"$TMP" \
+        || { _nav_action="back"; return 1; }
+    CLOUDFLARE_DOMAIN=$(<"$TMP")
+    CLOUDFLARE_DOMAIN="${CLOUDFLARE_DOMAIN# }"
+    CLOUDFLARE_DOMAIN="${CLOUDFLARE_DOMAIN% }"
+    CLOUDFLARE_DOMAIN="${CLOUDFLARE_DOMAIN#http://}"
+    CLOUDFLARE_DOMAIN="${CLOUDFLARE_DOMAIN#https://}"
+    CLOUDFLARE_DOMAIN="${CLOUDFLARE_DOMAIN%/}"
+}
+
+s_cf_routes() {
+    local candidates=()
+    is_selected "n8n"       && candidates+=("n8n"       "→ n8n:5678"             on)
+    is_selected "portainer" && candidates+=("portainer" "→ portainer:9000"       off)
+    is_selected "apache"    && candidates+=("apache"    "→ apache:80"            off)
+    is_selected "qdrant"    && candidates+=("qdrant"    "→ qdrant:6333"          off)
+    is_selected "ollama"    && candidates+=("ollama"    "→ ollama:11434"         off)
+    is_selected "nginx_proxy" && candidates+=("npm"     "→ NPM admin :81"        off)
+    is_selected "supabase"  && candidates+=("supabase-studio" "→ supabase-studio:3000" off)
+    is_selected "supabase"  && candidates+=("supabase-api"    "→ supabase-kong:8000"   off)
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        dialog --msgbox "Нет сервисов для маршрутизации.\nДобавьте n8n/portainer/etc." 7 55
+        _nav_action="next"
+        return 0
+    fi
+
+    if [[ -n "$CLOUDFLARE_ROUTES" ]]; then
+        local route_name i
+        for ((i=0; i<${#candidates[@]}; i+=3)); do
+            for route_name in ${CLOUDFLARE_ROUTES//,/ }; do
+                if [[ "$route_name" == "${candidates[$i]}" ]]; then
+                    candidates[$((i+2))]="on"
+                fi
+            done
+        done
+    fi
+
+    local _sel
+    _sel=$(_mktemp)
+    dialog --title "Маршруты Cloudflare Tunnel" \
+        --ok-label "Далее" --cancel-label "Назад" \
+        --checklist "Сервисы для публикации (создаются поддомены вида\nn8n.${CLOUDFLARE_DOMAIN:-домен}):" \
+        20 72 9 "${candidates[@]}" 2>"$_sel" \
+        || { _nav_action="back"; return 1; }
+
+    local raw routes=() item
+    raw=$(tr -d '"\r' <"$_sel")
+    for item in $raw; do
+        [[ -n "$item" ]] && routes+=("$item")
+    done
+    CLOUDFLARE_ROUTES=""
+    if [[ ${#routes[@]} -gt 0 ]]; then
+        CLOUDFLARE_ROUTES=$(IFS=','; echo "${routes[*]}")
+    fi
+
+    if [[ ${#routes[@]} -gt 0 ]]; then
+        local preview
+        preview=$(_mktemp)
+        {
+            printf 'Будут созданы маршруты:\n\n'
+            local r host service
+            for r in "${routes[@]}"; do
+                cf_route_to_host_service "$r" host service
+                printf '  %-40s → %s\n' "${host}" "${service}"
+            done
+            printf '\n'
+            if [[ "$CLOUDFLARE_MODE" == "token" ]]; then
+                printf '⚠ В режиме TOKEN маршруты добавьте вручную:\n'
+                printf '   dashboard.cloudflare.com → Tunnels →\n'
+                printf '   ваш тоннель → Public Hostnames → Add\n'
+            else
+                printf '✓ В режиме CONFIG маршруты применятся автоматически.\n'
+                printf '  Не забудьте создать DNS-записи (CNAME → ID.cfargotunnel.com)\n'
+                printf '  через: cloudflared tunnel route dns <name> <hostname>\n'
+            fi
+        } > "$preview"
+        dialog --title "Превью маршрутов" --textbox "$preview" 20 75
+    fi
+}
+
+cf_route_to_host_service() {
+    local key="$1" host_ref="$2" svc_ref="$3"
+    local h s
+    case "$key" in
+        n8n)             h="n8n.${CLOUDFLARE_DOMAIN}";       s="http://n8n:5678" ;;
+        portainer)       h="portainer.${CLOUDFLARE_DOMAIN}"; s="http://portainer:9000" ;;
+        apache)          h="${CLOUDFLARE_DOMAIN}";           s="http://apache:80" ;;
+        qdrant)          h="qdrant.${CLOUDFLARE_DOMAIN}";    s="http://qdrant:6333" ;;
+        ollama)          h="ollama.${CLOUDFLARE_DOMAIN}";    s="http://ollama:11434" ;;
+        npm)             h="npm.${CLOUDFLARE_DOMAIN}";       s="http://nginx-proxy-manager:81" ;;
+        supabase-studio) h="studio.${CLOUDFLARE_DOMAIN}";    s="http://supabase-studio:3000" ;;
+        supabase-api)    h="api.${CLOUDFLARE_DOMAIN}";       s="http://supabase-kong:8000" ;;
+        *)               h=""; s="" ;;
+    esac
+    printf -v "$host_ref" "%s" "$h"
+    printf -v "$svc_ref"  "%s" "$s"
+}
+
+s_confirm() {
+    local _sf
+    _sf=$(_mktemp)
+    {
+        printf 'Сервисы для установки:\n\n'
+        local s
+        for s in "${SELECTED_ARRAY[@]+"${SELECTED_ARRAY[@]}"}"; do
+            printf '  • %s\n' "$s"
+        done
+        printf '\nПараметры:\n'
+        is_selected "postgres" && \
+            printf '  PostgreSQL пароль: %s\n' "$([[ -n "$PGPASSWORD" ]] && echo "**** установлен" || echo "(пусто)")"
+        is_selected "supabase" && \
+            printf '  JWT Secret: %s\n' "$([[ -n "$JWT_SECRET" ]] && echo "**** установлен" || echo "(пусто)")"
+        is_selected "ollama" && \
+            printf '  LLM: %s → %s\n' "$LLM_TYPE" "$LLM_API_URL"
+        printf '  Домен: %s%s\n' "${DOMAIN:-(нет)}" "$([[ $DOMAIN_HTTPS == 1 ]] && echo " [HTTPS]" || echo "")"
+        if is_selected "supabase"; then
+            printf '  Supabase домен: %s%s\n' "${SUPABASE_DOMAIN:-(нет)}" \
+                "$([[ $SUPABASE_HTTPS == 1 ]] && echo " [HTTPS]" || echo "")"
+            printf '  Supabase порты: Studio=%s DB=%s API=%s Pooler=%s\n' \
+                "$SUPABASE_PORT_STUDIO" "$SUPABASE_PORT_PG" \
+                "$SUPABASE_PORT_API" "$SUPABASE_PORT_POOLER"
+        fi
+        if is_selected "n8n"; then
+            local db_label="SQLite"
+            [[ "$N8N_DB_POSTGRES" == "1" ]] && db_label="PostgreSQL"
+            printf '  n8n: порт %s (БД: %s)\n' "$N8N_PORT" "$db_label"
+        fi
+        is_selected "apache"    && printf '  Apache: порт %s, путь %s\n' "$APACHE_HTTP_PORT" "$APACHE_WWW_PATH"
+        is_selected "portainer" && printf '  Portainer порт: %s\n' "$PORTAINER_PORT"
+        is_selected "qdrant"    && printf '  Qdrant порт: %s\n' "$QDRANT_PORT"
+        is_selected "ollama"    && printf '  Ollama порт: %s\n' "$OLLAMA_PORT"
+        if is_selected "cloudflared"; then
+            printf '  Cloudflare: режим=%s, домен=%s\n' \
+                "${CLOUDFLARE_MODE:-?}" "${CLOUDFLARE_DOMAIN:-?}"
+            printf '  CF маршруты: %s\n' "${CLOUDFLARE_ROUTES:-(нет)}"
+        fi
+        printf '\nДалее — начать установку\nНазад — изменить параметры\n'
+    } > "$_sf"
+
+    if dialog --title "[$((_STEP+1))/${_STEP_MAX}] Подтверждение" \
+        --yes-label "Далее" --no-label "Назад" \
+        --yesno "$(cat "$_sf")" 28 74; then
+        _nav_action="next"
+    else
+        _nav_action="back"
+    fi
+}
+
+run_steps() {
+    build_steps
+    _STEP=0
+    while true; do
+        _nav_action="next"
+        "${_STEP_FUNC[$_STEP]}"
+        case "$_nav_action" in
+            next)
+                _STEP=$((_STEP + 1))
+                [[ $_STEP -ge $_STEP_MAX ]] && return 0
+                ;;
+            back)
+                _STEP=$((_STEP - 1))
+                [[ $_STEP -lt 0 ]] && { _STEP=0; return 1; }
+                ;;
+            cancel) return 1 ;;
+        esac
+    done
+}
+
+show_welcome() {
+    dialog --title "Установщик сервисов v5.1" \
+        --yes-label "Начать" --no-label "Выйти" \
+        --yesno "
+Автоматическая установка серверных сервисов:
+
+  • PostgreSQL        — реляционная БД
+  • Qdrant            — векторная БД
+  • Ollama            — локальные LLM
+  • Apache            — веб-сервер
+  • Nginx Proxy Mgr   — реверс-прокси + SSL
+  • Cloudflare Tunnel — внешний доступ без портов
+  • Portainer         — управление Docker
+  • Supabase          — Firebase-альтернатива
+  • n8n               — no-code автоматизация
+
+Особенности:
+  ✓ NPM и Cloudflare Tunnel могут работать вместе
+  ✓ Идемпотентность — повторный запуск безопасен
+  ✓ Параметры сохраняются в ${PARAMS_FILE}
+  ✓ Лог: ${LOG_FILE}
+
+Требования: Ubuntu/Debian, root, интернет.
+" 27 78 || exit 0
+}
+
+show_service_menu() {
+    local _backup=("${SELECTED_ARRAY[@]+"${SELECTED_ARRAY[@]}"}")
+    local args=(
+        "postgres"      "PostgreSQL (реляционная БД)"            off
+        "qdrant"        "Qdrant (векторная БД)"                  off
+        "ollama"        "Ollama (локальные LLM)"                 off
+        "apache"        "Apache (веб-сервер)"                    off
+        "nginx_proxy"   "Nginx Proxy Manager + SSL"              off
+        "cloudflared"   "Cloudflare Tunnel (внешний доступ)"     off
+        "portainer"     "Portainer (управление Docker)"          off
+        "supabase"      "Supabase (BaaS платформа)"              off
+        "n8n"           "n8n (автоматизация)"                    off
+    )
+    local i s
+    for ((i=0; i<${#args[@]}; i+=3)); do
+        for s in "${SELECTED_ARRAY[@]+"${SELECTED_ARRAY[@]}"}"; do
+            [[ "${args[$i]}" == "$s" ]] && args[$((i+2))]="on"
+        done
+    done
+
+    local _sel
+    _sel=$(_mktemp)
+    dialog --title "Выбор сервисов" \
+        --ok-label "Далее" --cancel-label "Отмена" \
+        --checklist "Пробел — выбрать; Enter — далее" \
+        22 70 11 "${args[@]}" 2>"$_sel" \
+        || {
+            SELECTED_ARRAY=("${_backup[@]+"${_backup[@]}"}")
+            return 1
+        }
+
+    SELECTED_ARRAY=()
+    if [[ -s "$_sel" ]]; then
+        local raw item
+        raw=$(tr -d '"\r' <"$_sel")
+        for item in $raw; do
+            [[ -n "$item" ]] && SELECTED_ARRAY+=("$item")
+        done
+    fi
+    save_selected_services
+    log "Selected: ${SELECTED_ARRAY[*]+"${SELECTED_ARRAY[*]}"}"
+}
+
+input_parameters() {
+    run_steps && save_params
+}
+
+ensure_docker() {
+    log_section "Docker check"
+    if ! command -v docker &>/dev/null; then
+        install_docker
+    else
+        if ! docker info &>/dev/null; then
+            systemctl start docker 2>/dev/null || true
+            sleep 3
+        fi
+        if ! docker compose version &>/dev/null; then
+            run_with_progress "Docker" "Установка compose-plugin..." \
+                apt-get install -y docker-compose-plugin
+        fi
+        verify_docker
+    fi
+}
+
+install_docker() {
+    log "Installing Docker..."
+    run_with_progress "Docker" "Обновление apt..." apt-get update
+    local sh
+    sh=$(_mktemp)
+    run_with_progress "Docker" "Скачивание установщика..." \
+        bash -c "curl -fsSL https://get.docker.com -o '$sh'"
+    run_with_progress "Docker" "Установка Docker (займёт пару минут)..." \
+        bash "$sh"
+    usermod -aG docker "$REAL_USER" 2>/dev/null || true
+    systemctl enable docker --now >/dev/null 2>&1 || true
+
+    if ! command -v docker &>/dev/null; then
+        dialog --title "Ошибка" --msgbox "Docker не установлен.\nЛог: $LOG_FILE" 8 55
+        exit 1
+    fi
+    if ! docker compose version &>/dev/null; then
+        run_with_progress "Docker" "Установка compose-plugin..." \
+            apt-get install -y docker-compose-plugin
+    fi
+    verify_docker
+}
+
+verify_docker() {
+    log "Verifying docker with hello-world..."
+    local out
+    out=$(_mktemp)
+    if docker run --rm hello-world >"$out" 2>&1; then
+        log "Docker OK"
+        return 0
+    fi
+    log "Docker FAILED, attempting auto-repair"
+    cat "$out" >>"$LOG_FILE"
+    if grep -qi "failed to lease\|containerd" "$out"; then
+        info_box "Docker" "Найдена проблема containerd. Авто-починка..." 2
+        systemctl stop docker containerd 2>/dev/null || true
+        rm -rf /var/lib/containerd/io.containerd.metadata.v1.bolt/* 2>/dev/null || true
+        rm -rf /var/lib/containerd/state/* /var/lib/containerd/tmpmounts/* 2>/dev/null || true
+        systemctl start containerd 2>/dev/null || true
+        sleep 2
+        systemctl start docker 2>/dev/null || true
+        sleep 3
+        if docker run --rm hello-world >"$out" 2>&1; then
+            info_box "Docker" "Docker починен." 2
+            return 0
+        fi
+    fi
+    dialog --title "Ошибка Docker" --textbox "$out" 20 80
+    exit 1
+}
+
+setup_network() {
+    log_section "Network + .env setup"
+    docker network inspect internal_network &>/dev/null \
+        || docker network create internal_network >>"$LOG_FILE" 2>&1
+    mkdir -p "$SETUP_DIR"
+    cd "$SETUP_DIR" || return 1
+    [[ ! -f .env ]] && touch .env
+    chmod 600 .env
+
+    is_selected "postgres" && \
+        inject_env .env POSTGRES_PASSWORD "$(env_esc "$PGPASSWORD")"
+    is_selected "supabase" && \
+        inject_env .env JWT_SECRET "$(env_esc "$JWT_SECRET")"
+    inject_env .env LLM_TYPE    "$(env_esc "$LLM_TYPE")"
+    inject_env .env LLM_API_KEY "$(env_esc "$LLM_API_KEY")"
+    inject_env .env LLM_API_URL "$(env_esc "$LLM_API_URL")"
+    inject_env .env DOMAIN      "$(env_esc "$DOMAIN")"
+    is_selected "supabase" && \
+        inject_env .env SUPABASE_DOMAIN "$(env_esc "$SUPABASE_DOMAIN")"
+
+    if is_selected "n8n"; then
+        inject_env .env N8N_PORT        "$N8N_PORT"
+        inject_env .env N8N_DB_POSTGRES "$N8N_DB_POSTGRES"
+    fi
+    if is_selected "apache"; then
+        inject_env .env APACHE_WWW_PATH  "$(env_esc "$APACHE_WWW_PATH")"
+        inject_env .env APACHE_HTTP_PORT "$APACHE_HTTP_PORT"
+    fi
+    is_selected "qdrant"    && inject_env .env QDRANT_PORT    "$QDRANT_PORT"
+    is_selected "portainer" && inject_env .env PORTAINER_PORT "$PORTAINER_PORT"
+    is_selected "ollama"    && inject_env .env OLLAMA_PORT    "$OLLAMA_PORT"
+
+    if is_selected "cloudflared"; then
+        inject_env .env CLOUDFLARE_MODE   "$(env_esc "$CLOUDFLARE_MODE")"
+        inject_env .env CLOUDFLARE_DOMAIN "$(env_esc "$CLOUDFLARE_DOMAIN")"
+    fi
+    log "Network & .env updated"
+}
+
+setup_cloudflared() {
+    is_selected "cloudflared" || return 0
+    log_section "Cloudflare Tunnel setup"
+
+    mkdir -p "$SETUP_DIR/cloudflared"
+    chmod 700 "$SETUP_DIR/cloudflared"
+
+    find "$SETUP_DIR/cloudflared" -maxdepth 1 -name "*.json" \
+        -not -name "${CLOUDFLARE_TUNNEL_ID}.json" -delete 2>/dev/null || true
+
+    if [[ "$CLOUDFLARE_MODE" == "config" ]]; then
+        cf_generate_config
+    else
+        rm -f "$SETUP_DIR/cloudflared/config.yml" 2>/dev/null || true
+    fi
+
+    log "Cloudflared mode: $CLOUDFLARE_MODE"
+}
+
+cf_generate_config() {
+    local cfg="$SETUP_DIR/cloudflared/config.yml"
+    local creds="$SETUP_DIR/cloudflared/${CLOUDFLARE_TUNNEL_ID}.json"
+
+    cat > "$creds" <<EOF
+{
+  "AccountTag": "${CLOUDFLARE_ACCOUNT_TAG}",
+  "TunnelID": "${CLOUDFLARE_TUNNEL_ID}",
+  "TunnelSecret": "${CLOUDFLARE_TUNNEL_SECRET}"
+}
+EOF
+    chmod 600 "$creds"
+
+    {
+        printf 'tunnel: %s\n' "$CLOUDFLARE_TUNNEL_ID"
+        printf 'credentials-file: /etc/cloudflared/%s.json\n' "$CLOUDFLARE_TUNNEL_ID"
+        printf 'no-autoupdate: true\n\n'
+        printf 'ingress:\n'
+
+        local r host service has_routes=0
+        for r in ${CLOUDFLARE_ROUTES//,/ }; do
+            cf_route_to_host_service "$r" host service
+            [[ -z "$host" ]] && continue
+            has_routes=1
+            printf '  - hostname: %s\n' "$host"
+            printf '    service: %s\n' "$service"
+        done
+
+        if [[ $has_routes -eq 0 ]]; then
+            log "WARN: cloudflared config has no routes — only catch-all"
+        fi
+
+        printf '  - service: http_status:404\n'
+    } > "$cfg"
+    chmod 600 "$cfg"
+    log "Cloudflared config.yml generated"
+}
+
+verify_cloudflared() {
+    is_selected "cloudflared" || return 0
+    log "Verifying cloudflared..."
+    local i logs
+    for i in 1 2 3 4 5; do
+        sleep 3
+        logs=$(docker logs cloudflared 2>&1 | tail -40)
+        if printf '%s' "$logs" | grep -qiE "Registered tunnel connection|connIndex.*Connected"; then
+            log "Cloudflared: tunnel connected (attempt $i)"
+            return 0
+        fi
+    done
+    log "Cloudflared verify FAILED. Logs:"
+    printf '%s\n' "$logs" >>"$LOG_FILE"
+
+    local lf
+    lf=$(_mktemp)
+    {
+        printf 'Cloudflared не подтвердил подключение за 15 сек.\n\n'
+        printf 'Возможные причины:\n'
+        printf '  • Неверный токен/credentials\n'
+        printf '  • Нет интернета или Cloudflare блокирует IP\n'
+        printf '  • Тоннель удалён в dashboard\n\n'
+        printf 'Последние логи cloudflared:\n'
+        printf '────────────────────────────────────────\n'
+        printf '%s\n' "$logs"
+    } > "$lf"
+    dialog --title "Cloudflare Tunnel — внимание" --textbox "$lf" 24 80
+    return 1
+}
+supabase_wait_healthy() {
+    local container="$1" max_wait="${2:-180}"
+    local elapsed=0 status=""
+    while [[ $elapsed -lt $max_wait ]]; do
+        status=$(docker inspect --format '{{.State.Health.Status}}' "$container" 2>/dev/null || echo "missing")
+        case "$status" in
+            healthy) log "  ✓ $container healthy (${elapsed}s)"; return 0 ;;
+            missing) log "  ✗ $container missing"; return 1 ;;
+        esac
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    log "  ⚠ $container timeout after ${max_wait}s (status: $status)"
+    return 1
+}
+
+supabase_wait_pg_ready() {
+    local container="$1" max_wait="${2:-120}"
+    local elapsed=0
+    while [[ $elapsed -lt $max_wait ]]; do
+        if docker exec -T "$container" pg_isready -U postgres -h localhost &>/dev/null; then
+            log "  ✓ $container accepting connections (${elapsed}s)"
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    log "  ⚠ $container not accepting connections after ${max_wait}s"
+    return 1
+}
+
+supabase_patch_compose() {
+    local f="docker-compose.yml"
+    [[ ! -f "$f" ]] && { log "ERROR: $f not found"; return 1; }
+
+    [[ ! -f "${f}.orig" ]] && cp "$f" "${f}.orig"
+    cp "${f}.orig" "$f"
+
+    sed -i.bak \
+        -e "s|\${STUDIO_PORT}:3000|${SUPABASE_PORT_STUDIO}:3000|g" \
+        -e "s|\${KONG_HTTP_PORT}:8000|${SUPABASE_PORT_API}:8000|g" \
+        -e "s|\${POSTGRES_PORT}:5432|${SUPABASE_PORT_PG}:5432|g" \
+        -e "s|\${POOLER_PROXY_PORT_TRANSACTION}:6543|${SUPABASE_PORT_POOLER}:6543|g" \
+        "$f"
+    rm -f "${f}.bak"
+
+    if ! grep -q "internal_network" "$f"; then
+        cat >> "$f" <<'NETEOF'
+
+networks:
+  default:
+    name: supabase_default
+  internal_network:
+    external: true
+NETEOF
+    fi
+
+    log "Supabase: ports patched (Studio=$SUPABASE_PORT_STUDIO, DB=$SUPABASE_PORT_PG, API=$SUPABASE_PORT_API, Pooler=$SUPABASE_PORT_POOLER)"
+}
+
+supabase_download() {
+    [[ -d "$SETUP_DIR/supabase-docker" ]] && return 0
+    log "Downloading Supabase docker folder..."
+
+    local archive="$SETUP_DIR/supabase.tar.gz"
+    local ok=0
+
+    if command -v curl &>/dev/null; then
+        log "  attempt 1: curl codeload"
+        rm -f "$archive"
+        if timeout 600 curl -fSL --retry 3 --retry-delay 5 \
+            -o "$archive" \
+            "https://codeload.github.com/supabase/supabase/tar.gz/refs/heads/master" \
+            >>"$LOG_FILE" 2>&1; then
+            ok=1
+        fi
+    fi
+    if [[ $ok -eq 0 ]] && command -v wget &>/dev/null; then
+        log "  attempt 2: wget"
+        rm -f "$archive"
+        if timeout 600 wget -q --tries=3 --timeout=60 \
+            -O "$archive" \
+            "https://codeload.github.com/supabase/supabase/tar.gz/refs/heads/master" \
+            >>"$LOG_FILE" 2>&1; then
+            ok=1
+        fi
+    fi
+    if [[ $ok -eq 0 ]]; then
+        log "  attempt 3: git clone"
+        rm -rf "$SETUP_DIR/supabase-git"
+        if command -v git &>/dev/null && \
+           timeout 600 git clone --depth 1 https://github.com/supabase/supabase \
+               "$SETUP_DIR/supabase-git" >>"$LOG_FILE" 2>&1; then
+            if [[ -d "$SETUP_DIR/supabase-git/docker" ]]; then
+                mv "$SETUP_DIR/supabase-git/docker" "$SETUP_DIR/supabase-docker"
+                rm -rf "$SETUP_DIR/supabase-git"
+                return 0
+            fi
+        fi
+    fi
+
+    if [[ $ok -eq 1 ]] && [[ -f "$archive" ]]; then
+        log "  extracting..."
+        mkdir -p "$SETUP_DIR/supabase-tmp"
+        if tar -xzf "$archive" -C "$SETUP_DIR/supabase-tmp" >>"$LOG_FILE" 2>&1; then
+            local d
+            d=$(ls "$SETUP_DIR/supabase-tmp/" 2>/dev/null | head -1)
+            if [[ -n "$d" ]] && [[ -d "$SETUP_DIR/supabase-tmp/$d/docker" ]]; then
+                mv "$SETUP_DIR/supabase-tmp/$d/docker" "$SETUP_DIR/supabase-docker"
+                rm -rf "$SETUP_DIR/supabase-tmp" "$archive"
+                return 0
+            fi
+        fi
+        rm -rf "$SETUP_DIR/supabase-tmp" "$archive"
+    fi
+
+    return 1
+}
+
+supabase_start_staged() {
+    local total_stages=6
+    local stage=0
+
+    stage=1
+    info_box "Supabase ($stage/$total_stages)" "Запуск PostgreSQL..." 1
+    log "Supabase stage $stage: db"
+    docker compose -p supabase up -d db >>"$LOG_FILE" 2>&1 || return 1
+    supabase_wait_pg_ready supabase-db 120
+    supabase_wait_healthy supabase-db 60 || log "  WARN: db not fully healthy, continuing"
+
+    stage=2
+    info_box "Supabase ($stage/$total_stages)" "Запуск Vector (логи)..." 1
+    log "Supabase stage $stage: vector"
+    docker compose -p supabase up -d vector >>"$LOG_FILE" 2>&1 || true
+    supabase_wait_healthy supabase-vector 60 || log "  WARN: vector slow"
+
+    stage=3
+    info_box "Supabase ($stage/$total_stages)" "Запуск аналитики (Logflare)..." 1
+    log "Supabase stage $stage: analytics"
+    docker compose -p supabase up -d analytics >>"$LOG_FILE" 2>&1 || true
+    supabase_wait_healthy supabase-analytics 120 || log "  WARN: analytics slow"
+
+    stage=4
+    info_box "Supabase ($stage/$total_stages)" "Запуск сервисов БД..." 1
+    log "Supabase stage $stage: meta/auth/rest/storage/realtime/functions/imgproxy/supavisor"
+    docker compose -p supabase up -d \
+        meta auth rest storage realtime functions imgproxy supavisor \
+        >>"$LOG_FILE" 2>&1 || true
+    sleep 10
+    local s
+    for s in supabase-auth supabase-rest supabase-storage supabase-meta supabase-realtime; do
+        supabase_wait_healthy "$s" 60 || log "  WARN: $s not fully healthy"
+    done
+
+    stage=5
+    info_box "Supabase ($stage/$total_stages)" "Запуск API Gateway (Kong)..." 1
+    log "Supabase stage $stage: kong"
+    docker compose -p supabase up -d kong >>"$LOG_FILE" 2>&1 || true
+    supabase_wait_healthy supabase-kong 60 || log "  WARN: kong slow"
+
+    stage=6
+    info_box "Supabase ($stage/$total_stages)" "Запуск Studio (UI)..." 1
+    log "Supabase stage $stage: studio"
+    docker compose -p supabase up -d studio >>"$LOG_FILE" 2>&1 || true
+    supabase_wait_healthy supabase-studio 90 || log "  WARN: studio slow"
+
+    info_box "Supabase" "Стабилизация (15 сек)..." 1
+    sleep 15
+    return 0
+}
+
+supabase_connect_network() {
+    local c
+    docker ps --filter "name=supabase-" --format "{{.Names}}" 2>/dev/null \
+    | while IFS= read -r c; do
+        docker network connect internal_network "$c" 2>/dev/null || true
+    done
+    log "Supabase containers connected to internal_network"
+}
+
+supabase_verify() {
+    local critical=(supabase-db supabase-kong supabase-studio supabase-auth supabase-rest)
+    local missing=()
+    local svc st
+    for svc in "${critical[@]}"; do
+        st=$(docker inspect --format '{{.State.Status}}' "$svc" 2>/dev/null || echo "missing")
+        [[ "$st" != "running" ]] && missing+=("$svc:$st")
+    done
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        log "Supabase verify OK"
+        return 0
+    fi
+    log "Supabase verify FAILED: ${missing[*]}"
+    return 1
+}
+
+setup_supabase() {
+    is_selected "supabase" || return 0
+    log_section "Supabase setup"
+
+    pushd "$SETUP_DIR" >/dev/null || return 1
+
+    if ! supabase_download; then
+        popd >/dev/null
+        dialog --title "Ошибка Supabase" \
+            --msgbox "Не удалось скачать Supabase.\nПроверьте интернет/доступ к GitHub.\nЛог: $LOG_FILE" 9 60
+        return 1
+    fi
+
+    cd supabase-docker || { popd >/dev/null; return 1; }
+
+    cat > docker-compose.override.yml <<'OVR'
+services:
+  realtime:
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sSfL --head -o /dev/null http://localhost:4000/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+OVR
+
+    local is_new=0
+    if [[ ! -f .env ]] || ! grep -q "^ANON_KEY=" .env 2>/dev/null; then
+        is_new=1
+        cp .env.example .env
+        local ANON_KEY SERVICE_ROLE_KEY SECRET_KEY_BASE VAULT_ENC_KEY
+        local DASHBOARD_USERNAME DASHBOARD_PASSWORD
+        ANON_KEY=$(openssl rand -hex 32)
+        SERVICE_ROLE_KEY=$(openssl rand -hex 32)
+        SECRET_KEY_BASE=$(openssl rand -hex 32)
+        VAULT_ENC_KEY=$(openssl rand -hex 32)
+        DASHBOARD_USERNAME="supabase"
+        DASHBOARD_PASSWORD=$(openssl rand -hex 12)
+        local v
+        for v in ANON_KEY SERVICE_ROLE_KEY SECRET_KEY_BASE VAULT_ENC_KEY \
+                 DASHBOARD_USERNAME DASHBOARD_PASSWORD; do
+            inject_env .env "$v" "${!v}"
+        done
+        log "Supabase: dashboard credentials → user=$DASHBOARD_USERNAME pass=$DASHBOARD_PASSWORD"
+        echo "$DASHBOARD_USERNAME:$DASHBOARD_PASSWORD" > "$SETUP_DIR/supabase_credentials.txt"
+        chmod 600 "$SETUP_DIR/supabase_credentials.txt"
+    fi
+
+    [[ -n "$JWT_SECRET" ]] && inject_env .env JWT_SECRET "$(env_esc "$JWT_SECRET")"
+    [[ -n "$PGPASSWORD" ]] && inject_env .env POSTGRES_PASSWORD "$(env_esc "$PGPASSWORD")"
+
+    local scheme="http"
+    [[ "$SUPABASE_HTTPS" == "1" ]] && scheme="https"
+    if [[ -n "$SUPABASE_DOMAIN" ]]; then
+        inject_env .env API_EXTERNAL_URL    "$(env_esc "${scheme}://${SUPABASE_DOMAIN}")"
+        inject_env .env SITE_URL            "$(env_esc "${scheme}://${SUPABASE_DOMAIN}")"
+        inject_env .env SUPABASE_PUBLIC_URL "$(env_esc "${scheme}://${SUPABASE_DOMAIN}")"
+    else
+        local ip
+        ip=$(hostname -I | awk '{print $1}')
+        inject_env .env API_EXTERNAL_URL    "$(env_esc "http://${ip}:${SUPABASE_PORT_API}")"
+        inject_env .env SITE_URL            "$(env_esc "http://${ip}:${SUPABASE_PORT_STUDIO}")"
+        inject_env .env SUPABASE_PUBLIC_URL "$(env_esc "http://${ip}:${SUPABASE_PORT_API}")"
+    fi
+
+    supabase_patch_compose
+
+    info_box "Supabase" "Скачивание образов (5-15 мин)..." 1
+    log "Supabase: docker compose pull..."
+    docker compose -p supabase pull >>"$LOG_FILE" 2>&1 || \
+        log "WARN: some images failed to pull, will retry on up"
+
+    if [[ $is_new -eq 0 ]]; then
+        log "Supabase: existing installation — restarting"
+        docker compose -p supabase down >>"$LOG_FILE" 2>&1 || true
+        sleep 3
+    fi
+
+    supabase_start_staged
+    supabase_connect_network
+
+    if supabase_verify; then
+        local ip
+        ip=$(hostname -I | awk '{print $1}')
+        local studio_url="http://${ip}:${SUPABASE_PORT_STUDIO}"
+        [[ -n "$SUPABASE_DOMAIN" ]] && studio_url="${scheme}://${SUPABASE_DOMAIN}"
+        local creds=""
+        [[ -f "$SETUP_DIR/supabase_credentials.txt" ]] && \
+            creds=$(<"$SETUP_DIR/supabase_credentials.txt")
+        dialog --title "Supabase запущен" --msgbox \
+"Supabase успешно установлен!
+
+  Studio (UI):  ${studio_url}
+  API Gateway:  http://${ip}:${SUPABASE_PORT_API}
+  PostgreSQL:   ${ip}:${SUPABASE_PORT_PG}
+  Pooler:       ${ip}:${SUPABASE_PORT_POOLER}
+
+  Логин Studio: ${creds:-см. .env}
+
+Для подключения n8n используйте:
+  host=${ip} port=${SUPABASE_PORT_PG}
+  user=postgres password=<JWT_SECRET в params.env>" 18 70
+    else
+        dialog --title "Внимание" --msgbox \
+"Supabase запустился частично.
+Проверьте: docker ps | grep supabase
+Лог: $LOG_FILE" 9 60
+    fi
+
+    popd >/dev/null
+}
+
+generate_compose_file() {
+    cd "$SETUP_DIR" || return 1
+
+    local has=0 s
+    for s in postgres qdrant ollama nginx_proxy portainer n8n apache cloudflared; do
+        is_selected "$s" && has=1 && break
+    done
+    if [[ $has -eq 0 ]]; then
+        rm -f docker-compose.yml
+        return 0
+    fi
+
+    local pg_sq; pg_sq=$(yaml_sq_esc "$PGPASSWORD")
+    local www; www=$(compose_esc "$APACHE_WWW_PATH")
+
+    local webhook_url
+    if [[ -n "$DOMAIN" ]]; then
+        if [[ "$DOMAIN_HTTPS" == "1" ]]; then
+            webhook_url="https://${DOMAIN}/"
+        else
+            webhook_url="http://${DOMAIN}:${N8N_PORT}/"
+        fi
+    else
+        local ip; ip=$(hostname -I | awk '{print $1}')
+        webhook_url="http://${ip}:${N8N_PORT}/"
+    fi
+    local webhook_sq; webhook_sq=$(yaml_sq_esc "$webhook_url")
+
+    {
+        printf 'networks:\n  internal_network:\n    external: true\n\n'
+        printf 'volumes:\n'
+        is_selected "postgres"    && printf '  postgres_data:\n'
+        is_selected "qdrant"      && printf '  qdrant_storage:\n'
+        is_selected "ollama"      && printf '  ollama_data:\n'
+        if is_selected "nginx_proxy"; then
+            printf '  npm_data:\n  npm_letsencrypt:\n'
+        fi
+        is_selected "portainer"   && printf '  portainer_data:\n'
+        is_selected "n8n"         && printf '  n8n_data:\n'
+        printf '\nservices:\n'
+    } > docker-compose.yml
+
+    if is_selected "postgres"; then
+        mkdir -p "$SETUP_DIR/pg-init"
+        cat > "$SETUP_DIR/pg-init/init-n8n.sql" <<'SQLEOF'
+SELECT 'CREATE DATABASE n8n'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'n8n')\gexec
+SQLEOF
+        cat >> docker-compose.yml <<COMPEOF
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: '${pg_sq}'
+      POSTGRES_DB: appdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./pg-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d appdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal_network
+
+COMPEOF
+    fi
+
+    if is_selected "qdrant"; then
+        cat >> docker-compose.yml <<COMPEOF
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - '${QDRANT_PORT}:6333'
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    networks:
+      - internal_network
+
+COMPEOF
+    fi
+
+    if is_selected "ollama"; then
+        cat >> docker-compose.yml <<COMPEOF
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - '${OLLAMA_PORT}:11434'
+    environment:
+      OLLAMA_HOST: 0.0.0.0
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - internal_network
+
+COMPEOF
+    fi
+
+    if is_selected "apache"; then
+        cat >> docker-compose.yml <<COMPEOF
+  apache:
+    image: httpd:2.4-alpine
+    container_name: apache
+    restart: unless-stopped
+    ports:
+      - '${APACHE_HTTP_PORT}:80'
+    volumes:
+      - "${www}:/usr/local/apache2/htdocs/"
+      - "${www}/conf:/usr/local/apache2/conf/extra/"
+    networks:
+      - internal_network
+
+COMPEOF
+    fi
+
+    if is_selected "nginx_proxy"; then
+        cat >> docker-compose.yml <<'COMPEOF'
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+      - '81:81'
+    volumes:
+      - npm_data:/data
+      - npm_letsencrypt:/etc/letsencrypt
+    networks:
+      - internal_network
+
+COMPEOF
+    fi
+
+    if is_selected "cloudflared"; then
+        if [[ "$CLOUDFLARE_MODE" == "token" ]]; then
+            local cf_token_esc
+            cf_token_esc=$(yaml_sq_esc "$CLOUDFLARE_TOKEN")
+            cat >> docker-compose.yml <<COMPEOF
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token '${cf_token_esc}'
+    networks:
+      - internal_network
+
+COMPEOF
+        else
+            cat >> docker-compose.yml <<'COMPEOF'
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+    networks:
+      - internal_network
+
+COMPEOF
+        fi
+    fi
+
+    if is_selected "portainer"; then
+        cat >> docker-compose.yml <<COMPEOF
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    command: -H unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    ports:
+      - '${PORTAINER_PORT}:9000'
+    networks:
+      - internal_network
+
+COMPEOF
+    fi
+
+    if is_selected "n8n"; then
+        {
+            printf '  n8n:\n'
+            printf '    image: n8nio/n8n:latest\n'
+            printf '    container_name: n8n\n'
+            printf '    restart: unless-stopped\n'
+            printf '    ports:\n'
+            printf "      - '%s:5678'\n" "$N8N_PORT"
+            printf '    environment:\n'
+            if [[ "$N8N_DB_POSTGRES" == "1" ]] && is_selected "postgres"; then
+                printf '      DB_TYPE: postgresdb\n'
+                printf '      DB_POSTGRESDB_HOST: postgres\n'
+                printf "      DB_POSTGRESDB_PORT: '5432'\n"
+                printf '      DB_POSTGRESDB_DATABASE: n8n\n'
+                printf '      DB_POSTGRESDB_USER: admin\n'
+                printf "      DB_POSTGRESDB_PASSWORD: '%s'\n" "$pg_sq"
+            fi
+            printf '      N8N_HOST: %s\n' "${DOMAIN:-0.0.0.0}"
+            printf "      N8N_PORT: '5678'\n"
+            printf '      N8N_PROTOCOL: %s\n' "$([[ $DOMAIN_HTTPS == 1 ]] && echo https || echo http)"
+            printf "      WEBHOOK_URL: '%s'\n" "$webhook_sq"
+            printf '      GENERIC_TIMEZONE: Europe/Moscow\n'
+            if [[ "$N8N_DB_POSTGRES" == "1" ]] && is_selected "postgres"; then
+                printf '    depends_on:\n'
+                printf '      postgres:\n'
+                printf '        condition: service_healthy\n'
+            fi
+            printf '    volumes:\n'
+            printf '      - n8n_data:/home/node/.n8n\n'
+            printf '    networks:\n'
+            printf '      - internal_network\n\n'
+        } >> docker-compose.yml
+    fi
+
+    log "docker-compose.yml generated"
+}
+
+create_n8n_database() {
+    local wait_sec=0
+    log "n8n DB: waiting for postgres readiness..."
+    while [[ $wait_sec -lt 90 ]]; do
+        if docker exec -T postgres pg_isready -U admin -h localhost &>/dev/null; then
+            log "  ✓ postgres ready (${wait_sec}s)"
+            break
+        fi
+        sleep 3
+        wait_sec=$((wait_sec + 3))
+    done
+
+    local attempt
+    for attempt in 1 2 3; do
+        local check rc=0
+        check=$(docker exec -T postgres \
+            psql -U admin -h localhost -d appdb -tA \
+            -c "SELECT 1 FROM pg_database WHERE datname='n8n';" 2>&1) || rc=$?
+        log "n8n DB check #$attempt rc=$rc out=$check"
+        if [[ "$(printf '%s' "$check" | tr -d '[:space:]')" == "1" ]]; then
+            log "n8n DB exists"
+            return 0
+        fi
+
+        local result rc_c=0
+        result=$(docker exec -T postgres \
+            psql -U admin -h localhost -d appdb \
+            -c "CREATE DATABASE n8n;" 2>&1) || rc_c=$?
+        log "n8n DB create #$attempt rc=$rc_c out=$result"
+        if [[ $rc_c -eq 0 ]] || printf '%s' "$result" | grep -qi "already\|created"; then
+            log "n8n DB created"
+            return 0
+        fi
+        sleep 5
+    done
+    log "WARN: n8n DB creation failed after 3 attempts, n8n will retry"
+    return 0
+}
+
+start_containers() {
+    cd "$SETUP_DIR" || return 1
+    [[ ! -f docker-compose.yml ]] && return 0
+
+    log_section "Starting main containers"
+
+    if is_selected "postgres"; then
+        info_box "Запуск" "Этап 1/3: PostgreSQL..." 1
+        docker compose up -d postgres >>"$LOG_FILE" 2>&1
+
+        local wait_sec=0
+        while [[ $wait_sec -lt 60 ]]; do
+            local hs
+            hs=$(docker inspect --format '{{.State.Health.Status}}' postgres 2>/dev/null || echo "")
+            [[ "$hs" == "healthy" ]] && break
+            sleep 2
+            wait_sec=$((wait_sec + 2))
+        done
+
+        if is_selected "n8n" && [[ "$N8N_DB_POSTGRES" == "1" ]]; then
+            info_box "Запуск" "Этап 2/3: Создание БД n8n..." 1
+            create_n8n_database
+        fi
+
+        info_box "Запуск" "Этап 3/3: Остальные сервисы..." 1
+        docker compose up -d >>"$LOG_FILE" 2>&1
+    else
+        info_box "Запуск" "Запуск всех контейнеров..." 1
+        docker compose up -d >>"$LOG_FILE" 2>&1
+    fi
+
+    sleep 10
+    log "Containers after start:"
+    docker ps --format "  {{.Names}}: {{.Status}}" >>"$LOG_FILE" 2>&1
+
+    local running
+    running=$(docker ps --filter "label=com.docker.compose.project" --format '{{.Names}}' 2>/dev/null | wc -l)
+    if [[ $running -eq 0 ]]; then
+        dialog --title "Ошибка" --msgbox "Контейнеры не запустились.\nЛог: $LOG_FILE" 8 60
+        return 1
+    fi
+    log "Started: $running containers"
+}
+
+print_npm_info() {
+    is_selected "nginx_proxy" || return 0
+    local ip; ip=$(hostname -I | awk '{print $1}')
+    sleep 3
+    cat > "$SETUP_DIR/npm_info.txt" <<EOF
+Nginx Proxy Manager
+URL:   http://${ip}:81
+Login: admin@example.com
+Pass:  changeme
+
+(смените пароль при первом входе!)
+EOF
+    chmod 600 "$SETUP_DIR/npm_info.txt"
+}
+
+show_final_summary() {
+    local ip; ip=$(hostname -I | awk '{print $1}')
+    local sf="$STATE_DIR/final_summary.txt"
+    local running
+    running=$(docker ps --format "{{.Names}}: {{.Status}}" 2>/dev/null)
+
+    {
+        printf '════════════════════════════════════════════════════════\n'
+        printf '         УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО\n'
+        printf '════════════════════════════════════════════════════════\n\n'
+        printf '  IP сервера: %s\n\n' "$ip"
+        printf '── Запущенные контейнеры ──\n'
+        printf '%s\n' "${running:-(пусто)}"
+        printf '\n── Веб-интерфейсы ──\n'
+        is_selected "portainer"   && \
+            printf '  Portainer:   http://%s:%s\n' "$ip" "$PORTAINER_PORT"
+        is_selected "nginx_proxy" && \
+            printf '  NPM:         http://%s:81  (admin@example.com / changeme)\n' "$ip"
+        if is_selected "supabase"; then
+            local ss="http"
+            [[ "$SUPABASE_HTTPS" == "1" ]] && ss="https"
+            printf '  Supabase Studio: %s://%s:%s\n' "$ss" "${SUPABASE_DOMAIN:-$ip}" "$SUPABASE_PORT_STUDIO"
+            printf '  Supabase API:    %s://%s:%s\n' "$ss" "${SUPABASE_DOMAIN:-$ip}" "$SUPABASE_PORT_API"
+            printf '  Supabase DB:     %s:%s (user: postgres)\n' "$ip" "$SUPABASE_PORT_PG"
+            if [[ -f "$SETUP_DIR/supabase_credentials.txt" ]]; then
+                printf '  Studio login:    %s\n' "$(<"$SETUP_DIR/supabase_credentials.txt")"
+            fi
+        fi
+        if is_selected "n8n"; then
+            local ns="http"
+            [[ "$DOMAIN_HTTPS" == "1" ]] && [[ -n "$DOMAIN" ]] && ns="https"
+            printf '  n8n:         %s://%s:%s\n' "$ns" "${DOMAIN:-$ip}" "$N8N_PORT"
+        fi
+        is_selected "apache" && \
+            printf '  Apache:      http://%s:%s\n' "${DOMAIN:-$ip}" "$APACHE_HTTP_PORT"
+        is_selected "qdrant" && \
+            printf '  Qdrant:      http://%s:%s\n' "$ip" "$QDRANT_PORT"
+        is_selected "ollama" && \
+            printf '  Ollama:      http://%s:%s\n' "$ip" "$OLLAMA_PORT"
+
+        if is_selected "cloudflared"; then
+            printf '\n── Cloudflare Tunnel ──\n'
+            printf '  Режим: %s\n' "${CLOUDFLARE_MODE:-?}"
+            if [[ -n "$CLOUDFLARE_DOMAIN" ]] && [[ -n "$CLOUDFLARE_ROUTES" ]]; then
+                printf '  Маршруты:\n'
+                local r host service
+                for r in ${CLOUDFLARE_ROUTES//,/ }; do
+                    cf_route_to_host_service "$r" host service
+                    [[ -n "$host" ]] && printf '    https://%s\n' "$host"
+                done
+            fi
+            if [[ "$CLOUDFLARE_MODE" == "token" ]]; then
+                printf '  ⚠ Добавьте Public Hostnames в dashboard:\n'
+                printf '    https://one.dash.cloudflare.com → Tunnels\n'
+            else
+                printf '  ⚠ Создайте DNS-записи (если не сделано):\n'
+                printf '    cloudflared tunnel route dns <name> <hostname>\n'
+            fi
+        fi
+
+        printf '\n── Файлы ──\n'
+        printf '  Логи:       %s\n' "$LOG_FILE"
+        printf '  Параметры:  %s\n' "$PARAMS_FILE"
+        printf '  Compose:    %s/docker-compose.yml\n' "$SETUP_DIR"
+        printf '════════════════════════════════════════════════════════\n'
+    } > "$sf"
+    chmod 600 "$sf"
+    dialog --title "Итоги установки" --textbox "$sf" 32 80
+}
+
+reinstall_service() {
+    local svc="$1"
+    cd "$SETUP_DIR" || return 1
+    case "$svc" in
+        supabase)
+            dialog --yes-label "Удалить ВСЕ" --no-label "Отмена" \
+                --yesno "Переустановить Supabase?\n\nВСЕ ДАННЫЕ БУДУТ УДАЛЕНЫ!\nСделайте backup заранее." 9 60 \
+                || return 0
+            docker compose -p supabase down -v >>"$LOG_FILE" 2>&1 || true
+            rm -rf supabase-docker
+            setup_supabase
+            ;;
+        cloudflared)
+            generate_compose_file
+            docker compose stop cloudflared    >>"$LOG_FILE" 2>&1 || true
+            docker compose rm -fv cloudflared  >>"$LOG_FILE" 2>&1 || true
+            setup_cloudflared
+            docker compose up -d cloudflared   >>"$LOG_FILE" 2>&1
+            verify_cloudflared
+            ;;
+        *)
+            generate_compose_file
+            docker compose stop "$svc"    >>"$LOG_FILE" 2>&1 || true
+            docker compose rm -fv "$svc"  >>"$LOG_FILE" 2>&1 || true
+            docker compose up -d "$svc"   >>"$LOG_FILE" 2>&1
+            ;;
+    esac
+    info_box "Готово" "${svc} переустановлен." 2
+}
+
+show_status() {
+    local st
+    st=$(_mktemp)
+    {
+        printf '── docker compose ps (основные) ──\n'
+        if [[ -f "$SETUP_DIR/docker-compose.yml" ]]; then
+            (cd "$SETUP_DIR" && docker compose ps 2>&1) || echo "(нет)"
+        else
+            echo "(docker-compose.yml отсутствует)"
+        fi
+        printf '\n── docker compose ps (supabase) ──\n'
+        if [[ -d "$SETUP_DIR/supabase-docker" ]]; then
+            (cd "$SETUP_DIR/supabase-docker" && docker compose -p supabase ps 2>&1) || echo "(нет)"
+        else
+            echo "(не установлен)"
+        fi
+        printf '\n── Все контейнеры ──\n'
+        docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^cloudflared$'; then
+            printf '\n── Cloudflared последние логи ──\n'
+            docker logs --tail 15 cloudflared 2>&1 || true
+        fi
+    } > "$st"
+    dialog --title "Статус" --textbox "$st" 30 100
+}
+
+post_install_menu() {
+    while true; do
+        local c
+        c=$(dialog --title "Управление" --cancel-label "Выход" \
+            --menu "Выберите действие:" 20 65 9 \
+            "1" "Добавить/изменить сервисы" \
+            "2" "Переустановить сервис" \
+            "3" "Показать статус" \
+            "4" "Показать сводку" \
+            "5" "Просмотр логов" \
+            "6" "Полный сброс" \
+            "7" "Копировать лог в /tmp" \
+            "0" "Выход" \
+            3>&1 1>&2 2>&3) || return 0
+        case "$c" in
+            1)
+                show_service_menu || continue
+                [[ ${#SELECTED_ARRAY[@]} -eq 0 ]] && { info_box "" "Ничего не выбрано" 2; continue; }
+                input_parameters || continue
+                save_params
+                setup_network
+                setup_cloudflared
+                generate_compose_file
+                start_containers
+                print_npm_info
+                setup_supabase
+                verify_cloudflared
+                show_final_summary
+                ;;
+            2)
+                local arr=() names svc
+                names=$(docker ps --format '{{.Names}}' 2>/dev/null) || names=""
+                for svc in postgres qdrant ollama apache nginx-proxy-manager cloudflared portainer n8n; do
+                    printf '%s\n' "$names" | grep -qx "$svc" && arr+=("$svc" "$svc" off)
+                done
+                printf '%s\n' "$names" | grep -q "^supabase-" && arr+=("supabase" "Supabase (все)" off)
+                if [[ ${#arr[@]} -eq 0 ]]; then
+                    info_box "" "Нет запущенных сервисов" 2
+                    continue
+                fi
+                local sel
+                sel=$(_mktemp)
+                dialog --checklist "Выберите для переустановки:" 16 60 8 "${arr[@]}" 2>"$sel" || continue
+                local raw item
+                raw=$(tr -d '"\r' <"$sel")
+                for item in $raw; do
+                    [[ -n "$item" ]] && reinstall_service "$item"
+                done
+                ;;
+            3) show_status ;;
+            4) show_final_summary ;;
+            5) dialog --title "Лог" --textbox "$LOG_FILE" 32 100 ;;
+            6)
+                dialog --yes-label "Удалить" --no-label "Отмена" \
+                    --yesno "ПОЛНЫЙ СБРОС.\n\nБудет удалено:\n  • $STATE_DIR\n  • $SETUP_DIR\n  • Все контейнеры (с томами!)" 11 60 \
+                    || continue
+                (cd "$SETUP_DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true)
+                (cd "$SETUP_DIR/supabase-docker" 2>/dev/null && docker compose -p supabase down -v 2>/dev/null || true)
+                rm -rf "$STATE_DIR" "$SETUP_DIR"
+                info_box "Готово" "Сброшено. Перезапуск..." 2
+                exec "$0"
+                ;;
+            7)
+                cp "$LOG_FILE" /tmp/install.log 2>/dev/null && chmod 644 /tmp/install.log
+                local ip; ip=$(hostname -I | awk '{print $1}')
+                dialog --title "Лог скопирован" --msgbox \
+"  /tmp/install.log
+
+Скачайте локально:
+  scp root@${ip}:/tmp/install.log ." 11 60
+                ;;
+            0) return 0 ;;
+        esac
+    done
+}
+
+main() {
+    if ! grep -qi "ubuntu\|debian" /etc/os-release 2>/dev/null; then
+        echo "Только Ubuntu/Debian"
+        exit 1
+    fi
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "Запустите с sudo"
+        exit 1
+    fi
+    if ! command -v dialog &>/dev/null; then
+        apt-get update >/dev/null 2>&1 || true
+        apt-get install -y dialog >/dev/null 2>&1 || {
+            echo "Не удалось установить dialog"; exit 1; }
+    fi
+
+    local avail_gb
+    avail_gb=$(df -BG / | awk 'NR==2{gsub(/G/,""); print $4}')
+    if [[ "$avail_gb" =~ ^[0-9]+$ ]] && [[ $avail_gb -lt 5 ]]; then
+        dialog --msgbox "Свободно ${avail_gb}GB, нужно ≥5GB" 7 50
+        exit 1
+    fi
+
+    load_selected_services
+    load_params
+
+    if [[ $# -eq 2 ]] && [[ "$1" == "--reinstall" ]]; then
+        reinstall_service "$2"
+        exit 0
+    fi
+
+    local state
+    state=$(get_state)
+    case "$state" in
+        start)
+            show_welcome
+            show_service_menu || exit 0
+            [[ ${#SELECTED_ARRAY[@]} -eq 0 ]] && {
+                dialog --msgbox "Ничего не выбрано" 6 40; exit 1; }
+            input_parameters || { save_state "start"; exit 4; }
+            ensure_docker
+            save_state "docker_installed"
+            setup_network
+            setup_cloudflared
+            generate_compose_file
+            start_containers
+            print_npm_info
+            setup_supabase
+            verify_cloudflared
+            save_state "completed"
+            show_final_summary
+            ;;
+        docker_installed|completed)
+            ensure_docker
+            setup_network
+            setup_cloudflared
+            generate_compose_file
+            start_containers
+            print_npm_info
+            setup_supabase
+            verify_cloudflared
+            save_state "completed"
+            show_final_summary
+            ;;
+        *)
+            save_state "start"
+            exec "$0"
+            ;;
+    esac
+
+    post_install_menu
+}
+
+main "$@"
