@@ -3,7 +3,7 @@ curl -fsSL "https://raw.githubusercontent.com/Pavel-work/installer_docker/main/i
 ```
 .
 .
-.
+[![Made with Supabase](https://supabase.com/badge-made-with-supabase.svg)](https://supabase.com)
 .
 .
 ______________________________________________________________________________________________________________________________________________________________________________________________________________________
