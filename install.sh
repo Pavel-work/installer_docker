@@ -953,6 +953,38 @@ _supabase_ensure_network() {
     fi
 }
 
+_supabase_wait_healthy() {
+    # $1 = container_name, $2 = max seconds to wait
+    local container="$1" max_wait="${2:-120}"
+    local elapsed=0
+    while [[ $elapsed -lt $max_wait ]]; do
+        local status
+        status=$(docker inspect --format '{{.State.Health.Status}}' "$container" 2>/dev/null)
+        if [[ "$status" == "healthy" ]]; then
+            log "Supabase: $container — healthy after ${elapsed}s"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    log "WARNING: Supabase: $container did not become healthy in ${max_wait}s (current: $status)"
+    return 1
+}
+
+_supabase_step_up() {
+    # Поэтапный запуск: $1 = список сервисов (через пробел), $2 = заголовок, $3 = контейнер для health-ожидания
+    local services="$1" label="$2" health_container="$3"
+    dialog --title "Supabase" --gauge "[ЭТАП] $label" 8 60 0
+    log "Supabase: [UP]  $services"
+    docker compose -p supabase up -d $services >>"$LOG_FILE" 2>&1
+    if [[ -n "$health_container" ]]; then
+        sleep 10
+        _supabase_wait_healthy "$health_container" 180 || true
+    else
+        sleep 5
+    fi
+}
+
 verify_supabase() {
     local supa_count
     supa_count=$(docker ps \
@@ -985,28 +1017,92 @@ supabase_compose_pull_retry() {
 }
 
 supabase_compose_up() {
-    # Вызывается из setup_supabase; PWD = SETUP_DIR/supabase-docker
+    # ═══════════════════════════════════════════════════════════
+    #  Поэтапный запуск Supabase в правильном порядке зависимостей:
+    #
+    #  Этап 1: db (PostgreSQL)              → ждём healthy
+    #  Этап 2: analytics (Logflare)          → ждём healthy (зависит от db)
+    #  Этап 3: studio (dashboard)            → ждём healthy (зависит от analytics)
+    #  Этап 4: kong (API Gateway)            → ждём healthy (зависит от studio)
+    #  Этап 5: auth, rest, storage, meta,   → параллельно (все зависят только от db)
+    #          realtime, imgproxy, pooler,
+    #          vector, edge-functions, functions
+    # ═══════════════════════════════════════════════════════════
     local max_attempts=3 attempt=0
     while [[ $attempt -lt $max_attempts ]]; do
         attempt=$((attempt + 1))
-        log "Supabase compose up attempt $attempt/$max_attempts..."
+        log "Supabase compose up — stage launch attempt $attempt/$max_attempts"
 
-        if docker compose -p supabase up -d >>"$LOG_FILE" 2>&1; then
-            log "Supabase compose up (attempt $attempt) succeeded"
-            sleep 15
-            if verify_supabase; then
-                return 0
-            fi
-            log "Supabase compose up succeeded but verification failed, retrying..."
-            docker compose -p supabase down >>"$LOG_FILE" 2>&1 || true
-        else
-            log "ERROR: Supabase compose up attempt $attempt FAILED"
-            if [[ $attempt -lt $max_attempts ]]; then
-                log "Retrying image pull before next attempt..."
-                supabase_compose_pull_retry || true
-            fi
+        # --- Этап 1: БД ---
+        _supabase_step_up "db" "1/5 — Запуск PostgreSQL (db)" "supabase-db"
+        local db_ok=$?
+        # db критична — без неё дальше смысла нет
+        if [[ $db_ok -ne 0 ]]; then
+            local db_status
+            db_status=$(docker inspect --format '{{.State.Status}}' supabase-db 2>/dev/null)
+            log "WARNING: Supabase: db not healthy (status=$db_status), continuing anyway..."
         fi
-        sleep 10
+
+        # --- Этап 2: Аналитика ---
+        _supabase_step_up "analytics" "2/5 — Запуск аналитики (analytics)" "supabase-analytics"
+
+        # --- Этап 3: Студия (Dashboard) ---
+        _supabase_step_up "studio" "3/5 — Запуск студии (studio)" "supabase-studio"
+
+        # --- Этап 4: Kong (API Gateway) ---
+        _supabase_step_up "kong" "4/5 — Запуск API-шлюза (kong)" "supabase-kong"
+        local kong_status
+        kong_status=$(docker inspect --format '{{.State.Status}}' supabase-kong 2>/dev/null)
+        if [[ "$kong_status" != "running" ]]; then
+            log "WARNING: Supabase: kong not running after stage 4 (status=$kong_status), trying docker start..."
+            docker start supabase-kong >>"$LOG_FILE" 2>&1 || true
+            sleep 10
+            _supabase_wait_healthy "supabase-kong" 90 || true
+        fi
+
+        # --- Этап 5: Остальные сервисы (все зависят от db, но НЕ kong) ---
+        # Запускаем параллельно — у них нет cross-зависимостей
+        dialog --title "Supabase" --gauge "[ЭТАП] 5/5 — Все остальные сервисы" 8 60 0
+        docker compose -p supabase up -d \
+            auth rest storage meta realtime imgproxy pooler \
+            vector edge-functions functions \
+            >>"$LOG_FILE" 2>&1 || true
+        sleep 30
+
+        # --- Даем time на стабилизацию ---
+        log "Supabase: all services started, waiting 30s for stabilization..."
+        sleep 30
+
+        # --- Проверка ключевых сервисов ---
+        local critical_ok=1
+        for _svc in supabase-db supabase-analytics supabase-studio supabase-kong \
+                    supabase-auth supabase-rest supabase-storage; do
+            local st
+            st=$(docker inspect --format '{{.State.Status}}' "$_svc" 2>/dev/null)
+            if [[ "$st" == "running" ]]; then
+                log "Supabase: $_svc — running ✓"
+            else
+                log "WARNING: Supabase: $_svc — $st ✗ — пытаемся перезапустить"
+                docker start "$_svc" >>"$LOG_FILE" 2>&1 || true
+                # Если kong не запустился — это критично, пробуем ещё раз
+                if [[ "$_svc" == "supabase-kong" ]]; then
+                    critical_ok=0
+                fi
+            fi
+        done
+
+        if verify_supabase; then
+            log "Supabase: stage launch (attempt $attempt) — SUCCESS"
+            return 0
+        fi
+
+        log "WARNING: Supabase: stage launch attempt $attempt — some services missing, retrying..."
+        if [[ $attempt -lt $max_attempts ]]; then
+            log "Supabase: stopping for retry..."
+            docker compose -p supabase down >>"$LOG_FILE" 2>&1 || true
+            supabase_compose_pull_retry || true
+            sleep 15
+        fi
     done
     return 1
 }
