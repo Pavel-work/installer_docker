@@ -1130,66 +1130,116 @@ NETEOF
 }
 
 supabase_download() {
-    [[ -d "$SETUP_DIR/supabase-docker" ]] && return 0
-    log "Downloading Supabase docker folder..."
-
-    local archive="$SETUP_DIR/supabase.tar.gz"
-    local ok=0
-
-    if command -v curl &>/dev/null; then
-        log "  attempt 1: curl codeload"
-        rm -f "$archive"
-        if timeout 600 curl -fSL --retry 3 --retry-delay 5 \
-            -o "$archive" \
-            "https://codeload.github.com/supabase/supabase/tar.gz/refs/heads/master" \
-            >>"$LOG_FILE" 2>&1; then
-            ok=1
+    [[ -d "$SETUP_DIR/supabase-docker" ]] && {
+        # Проверяем что docker-compose.yml существует и корректен
+        if [[ -f "$SETUP_DIR/supabase-docker/docker-compose.yml" ]]; then
+            return 0
         fi
-    fi
-    if [[ $ok -eq 0 ]] && command -v wget &>/dev/null; then
-        log "  attempt 2: wget"
-        rm -f "$archive"
-        if timeout 600 wget -q --tries=3 --timeout=60 \
-            -O "$archive" \
-            "https://codeload.github.com/supabase/supabase/tar.gz/refs/heads/master" \
-            >>"$LOG_FILE" 2>&1; then
-            ok=1
+        # Есть папка но нет compose-файла — удаляем и начинаем заново
+        log "Supabase directory exists but docker-compose.yml missing, cleaning up"
+        rm -rf "$SETUP_DIR/supabase-docker"
+    }
+
+    log "Downloading Supabase docker folder (direct file download)..."
+    mkdir -p "$SETUP_DIR/supabase-docker"
+
+    local base_url="https://raw.githubusercontent.com/supabase/supabase/master/docker"
+    local files=(
+        "docker-compose.yml"
+        ".env.example"
+        "volumes/db/webhooks.sql"
+        "volumes/db/realtime.sql"
+        "volumes/db/roles.sql"
+        "volumes/db/jwt.sql"
+        "volumes/db/logs.sql"
+        "volumes/db/pooler.sql"
+        "volumes/db/_supabase.sql"
+        "volumes/api/kong-entrypoint.sh"
+        "volumes/api/kong.yml"
+        "volumes/pooler/pooler.exs"
+        "volumes/logs/vector.yml"
+    )
+
+    local f relpath localpath
+    for f in "${files[@]}"; do
+        relpath="$f"
+        localpath="$SETUP_DIR/supabase-docker/$f"
+        mkdir -p "$(dirname "$localpath")"
+        log "  Downloading $f"
+        if ! curl -fSL --retry 3 --retry-delay 5 -o "$localpath" "$base_url/$f" >>"$LOG_FILE" 2>&1; then
+            log "  ERROR: Failed to download $f"
+            rm -rf "$SETUP_DIR/supabase-docker"
+            return 1
         fi
+    done
+
+    # Создаём JWT-ключи для PostgreSQL
+    local jwt_dir="$SETUP_DIR/supabase-docker/volumes/db/jwt"
+    mkdir -p "$jwt_dir"
+    if [[ ! -f "$jwt_dir/secret" ]]; then
+        openssl genpkey -algorithm RSA -out "$jwt_dir/secret" -pkeyopt rsa_keygen_bits:2048 \
+            >>"$LOG_FILE" 2>&1 || true
     fi
-    if [[ $ok -eq 0 ]]; then
-        log "  attempt 3: git clone"
-        rm -rf "$SETUP_DIR/supabase-git"
-        if command -v git &>/dev/null && \
-           timeout 600 git clone --depth 1 https://github.com/supabase/supabase \
-               "$SETUP_DIR/supabase-git" >>"$LOG_FILE" 2>&1; then
-            if [[ -d "$SETUP_DIR/supabase-git/docker" ]]; then
-                mv "$SETUP_DIR/supabase-git/docker" "$SETUP_DIR/supabase-docker"
-                rm -rf "$SETUP_DIR/supabase-git"
-                return 0
+    openssl rsa -in "$jwt_dir/secret" -pubout -out "$jwt_dir/secret.pub" \
+        >>"$LOG_FILE" 2>&1 || true
+    chmod 600 "$jwt_dir/secret" 2>/dev/null || true
+
+    # Убеждаемся что entrypoint executable
+    chmod +x "$SETUP_DIR/supabase-docker/volumes/api/kong-entrypoint.sh" 2>/dev/null || true
+
+    # Создаём пустые директории для функций (edge-functions)
+    mkdir -p "$SETUP_DIR/supabase-docker/volumes/functions/main"
+    mkdir -p "$SETUP_DIR/supabase-docker/volumes/functions/user"
+
+    log "Supabase: docker folder downloaded successfully"
+    return 0
+}
+
+# Убеждаемся что bind-mount файлы — реально файлы, а не пустые директории
+# (Docker создаёт директорию при bind mount если файл не существует)
+supabase_validate_volumes() {
+    log "Supabase: validating volume files..."
+    local file
+    local files=(
+        "volumes/db/webhooks.sql"
+        "volumes/db/realtime.sql"
+        "volumes/db/roles.sql"
+        "volumes/db/jwt.sql"
+        "volumes/db/logs.sql"
+        "volumes/db/pooler.sql"
+        "volumes/db/_supabase.sql"
+        "volumes/api/kong-entrypoint.sh"
+        "volumes/api/kong.yml"
+        "volumes/pooler/pooler.exs"
+        "volumes/logs/vector.yml"
+    )
+
+    local base_url="https://raw.githubusercontent.com/supabase/supabase/master/docker"
+    local need_redownload=0
+
+    for file in "${files[@]}"; do
+        local path="$SETUP_DIR/supabase-docker/$file"
+        # Если не существует, или это директория, или пустой файл
+        if [[ -d "$path" ]] || [[ ! -s "$path" ]]; then
+            log "  $file is missing/empty/directory, re-downloading"
+            need_redownload=1
+            rm -rf "$path"
+            mkdir -p "$(dirname "$path")"
+            if ! curl -fSL --retry 3 --retry-delay 2 -o "$path" "$base_url/$file" >>"$LOG_FILE" 2>&1; then
+                log "  ERROR: Failed to re-download $file"
+                return 1
             fi
+            # Executable для shell-скриптов
+            [[ "$file" == *.sh ]] && chmod +x "$path" 2>/dev/null || true
         fi
-    fi
+    done
 
-    if [[ $ok -eq 1 ]] && [[ -f "$archive" ]]; then
-        log "  extracting..."
-        mkdir -p "$SETUP_DIR/supabase-tmp"
-        if tar -xzf "$archive" -C "$SETUP_DIR/supabase-tmp" >>"$LOG_FILE" 2>&1; then
-            local d
-            d=$(ls "$SETUP_DIR/supabase-tmp/" 2>/dev/null | head -1)
-            if [[ -n "$d" ]] && [[ -d "$SETUP_DIR/supabase-tmp/$d/docker" ]]; then
-                mv "$SETUP_DIR/supabase-tmp/$d/docker" "$SETUP_DIR/supabase-docker"
-                rm -rf "$SETUP_DIR/supabase-tmp" "$archive"
-                return 0
-            fi
-        fi
-        rm -rf "$SETUP_DIR/supabase-tmp" "$archive"
-    fi
-
-    return 1
+    [[ $need_redownload -eq 1 ]] && log "Supabase: volume files repaired" || log "Supabase: all volume files OK"
+    return 0
 }
 
 supabase_start_staged() {
-    local total_stages=6
+    local total_stages=7
     local stage=0
 
     stage=1
@@ -1200,16 +1250,16 @@ supabase_start_staged() {
     supabase_wait_healthy supabase-db 60 || log "  WARN: db not fully healthy, continuing"
 
     stage=2
-    info_box "Supabase ($stage/$total_stages)" "Запуск Vector (логи)..." 1
-    log "Supabase stage $stage: vector"
-    docker compose -p supabase $COMPOSE_FILES up -d vector >>"$LOG_FILE" 2>&1 || true
-    supabase_wait_healthy supabase-vector 60 || log "  WARN: vector slow"
-
-    stage=3
     info_box "Supabase ($stage/$total_stages)" "Запуск аналитики (Logflare)..." 1
     log "Supabase stage $stage: analytics"
     docker compose -p supabase $COMPOSE_FILES up -d analytics >>"$LOG_FILE" 2>&1 || true
-    supabase_wait_healthy supabase-analytics 120 || log "  WARN: analytics slow"
+    supabase_wait_healthy supabase-analytics 120 || log "  WARN: analytics slow, continuing"
+
+    stage=3
+    info_box "Supabase ($stage/$total_stages)" "Запуск Vector (логи)..." 1
+    log "Supabase stage $stage: vector"
+    docker compose -p supabase $COMPOSE_FILES up -d --force-recreate vector >>"$LOG_FILE" 2>&1 || true
+    supabase_wait_healthy supabase-vector 90 || log "  WARN: vector slow, continuing"
 
     stage=4
     info_box "Supabase ($stage/$total_stages)" "Запуск сервисов БД..." 1
@@ -1226,17 +1276,31 @@ supabase_start_staged() {
     stage=5
     info_box "Supabase ($stage/$total_stages)" "Запуск API Gateway (Kong)..." 1
     log "Supabase stage $stage: kong"
-    docker compose -p supabase $COMPOSE_FILES up -d kong >>"$LOG_FILE" 2>&1 || true
-    supabase_wait_healthy supabase-kong 60 || log "  WARN: kong slow"
+    docker compose -p supabase $COMPOSE_FILES up -d --force-recreate kong >>"$LOG_FILE" 2>&1 || true
+    supabase_wait_healthy supabase-kong 60 || log "  WARN: kong slow, continuing"
 
     stage=6
     info_box "Supabase ($stage/$total_stages)" "Запуск Studio (UI)..." 1
     log "Supabase stage $stage: studio"
     docker compose -p supabase $COMPOSE_FILES up -d studio >>"$LOG_FILE" 2>&1 || true
-    supabase_wait_healthy supabase-studio 90 || log "  WARN: studio slow"
+    supabase_wait_healthy supabase-studio 90 || log "  WARN: studio slow, continuing"
 
-    info_box "Supabase" "Стабилизация (15 сек)..." 1
+    stage=7
+    info_box "Supabase ($stage/$total_stages)" "Стабилизация..." 1
     sleep 15
+
+    # Финальная проверка и повторный рестарт проблемных контейнеров
+    local retry_svc
+    for retry_svc in supabase-vector supabase-kong; do
+        local st
+        st=$(docker inspect --format '{{.State.Status}}' "$retry_svc" 2>/dev/null || echo "missing")
+        if [[ "$st" != "running" ]]; then
+            log "Supabase: $retry_svc not running ($st), retrying..."
+            docker compose -p supabase $COMPOSE_FILES up -d --force-recreate "${retry_svc#supabase-}" >>"$LOG_FILE" 2>&1 || true
+            sleep 5
+        fi
+    done
+
     return 0
 }
 
@@ -1308,12 +1372,6 @@ services:
     ports:
       - "${SUPABASE_PORT_API}:8000"
       - "8443:8443"
-  edge-functions:
-    command:
-      - sh
-      - -c
-      - |
-        deno cache --reload /home/deno/function/index.ts && deno run --allow-all --unstable-sloppy-imports /home/deno/main.ts
 OVERRIDE_EOF
         log "Supabase: override created"
     else
@@ -1335,10 +1393,6 @@ OVERRIDE_EOF
             printf '\n  db:\n    ports:\n      - "%s:5432"\n' "${SUPABASE_PORT_PG}" >> "$ovf"
             log "Supabase: injected db ports into override"
         fi
-        if ! grep -q 'edge-functions:' "$ovf" 2>/dev/null; then
-            printf '\n  edge-functions:\n    command:\n      - sh\n      - -c\n      - |\n        deno cache --reload /home/deno/function/index.ts && deno run --allow-all --unstable-sloppy-imports /home/deno/main.ts\n' >> "$ovf"
-            log "Supabase: injected edge-functions fix into override"
-        fi
         log "Supabase: override updated/verified"
     fi
 
@@ -1354,19 +1408,59 @@ OVERRIDE_EOF
     if [[ ! -f .env ]] || ! grep -q "^ANON_KEY=" .env 2>/dev/null; then
         is_new=1
         cp .env.example .env
-        local ANON_KEY SERVICE_ROLE_KEY SECRET_KEY_BASE VAULT_ENC_KEY
-        local DASHBOARD_USERNAME DASHBOARD_PASSWORD
-        ANON_KEY=$(openssl rand -hex 32)
-        SERVICE_ROLE_KEY=$(openssl rand -hex 32)
-        SECRET_KEY_BASE=$(openssl rand -hex 32)
+
+        # Генерируем JWT-совместимые токены через openssl + base64
+        # ANON_KEY и SERVICE_ROLE_KEY — валидные JWT для PostgREST
+        local jwt_header='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9'
+        local jwt_payload_anon
+        jwt_payload_anon=$(printf '{"role":"anon","iss":"supabase","iat":%d,"exp":1799535600}' "$(date +%s)" | base64 -w0)
+        local jwt_payload_service
+        jwt_payload_service=$(printf '{"role":"service_role","iss":"supabase","iat":%d,"exp":1799535600}' "$(date +%s)" | base64 -w0)
+
+        ANON_KEY="${jwt_header}.${jwt_payload_anon}.$(openssl rand -hex 32)"
+        SERVICE_ROLE_KEY="${jwt_header}.${jwt_payload_service}.$(openssl rand -hex 32)"
+
+        # SUPABASE_PUBLISHABLE_KEY и SUPABASE_SECRET_KEY должны отличаться от ANON/SERVICE_ROLE
+        # чтобы Kong не получил дубли keyauth_credentials
+        local jwt_payload_pub
+        jwt_payload_pub=$(printf '{"role":"anon_pub","iss":"supabase","iat":%d}' "$(date +%s)" | base64 -w0)
+        local jwt_payload_sec
+        jwt_payload_sec=$(printf '{"role":"service_sec","iss":"supabase","iat":%d}' "$(date +%s)" | base64 -w0)
+        local SUPABASE_PUBLISHABLE_KEY="${jwt_header}.${jwt_payload_pub}.$(openssl rand -hex 32)"
+        local SUPABASE_SECRET_KEY_ALT="${jwt_header}.${jwt_payload_sec}.$(openssl rand -hex 32)"
+
+        # SECRET_KEY_BASE: realtime/elixir требует минимум 64 байта
+        SECRET_KEY_BASE=$(openssl rand -hex 64)
         VAULT_ENC_KEY=$(openssl rand -hex 32)
+
+        # Дополнительно для Kong uniqueness и storage
+        local S3_PROTOCOL_ACCESS_KEY_ID
+        S3_PROTOCOL_ACCESS_KEY_ID=$(openssl rand -hex 16)
+        local S3_PROTOCOL_ACCESS_KEY_SECRET
+        S3_PROTOCOL_ACCESS_KEY_SECRET=$(openssl rand -hex 32)
+        local LOGFLARE_PUBLIC_ACCESS_TOKEN
+        LOGFLARE_PUBLIC_ACCESS_TOKEN=$(openssl rand -hex 32)
+        local LOGFLARE_PRIVATE_ACCESS_TOKEN
+        LOGFLARE_PRIVATE_ACCESS_TOKEN=$(openssl rand -hex 32)
+        local PG_META_CRYPTO_KEY
+        PG_META_CRYPTO_KEY=$(openssl rand -hex 32)
+
         DASHBOARD_USERNAME="supabase"
-        DASHBOARD_PASSWORD=$(openssl rand -hex 12)
+        DASHBOARD_PASSWORD=$(openssl rand -hex 16)
+
         local v
-        for v in ANON_KEY SERVICE_ROLE_KEY SECRET_KEY_BASE VAULT_ENC_KEY \
+        for v in ANON_KEY SERVICE_ROLE_KEY SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY \
+                 SECRET_KEY_BASE VAULT_ENC_KEY PG_META_CRYPTO_KEY \
+                 S3_PROTOCOL_ACCESS_KEY_ID S3_PROTOCOL_ACCESS_KEY_SECRET \
+                 LOGFLARE_PUBLIC_ACCESS_TOKEN LOGFLARE_PRIVATE_ACCESS_TOKEN \
                  DASHBOARD_USERNAME DASHBOARD_PASSWORD; do
             inject_env .env "$v" "${!v}"
         done
+
+        # Убеждаемся что JWT_KEYS и JWT_JWKS пусты, чтобы они НЕ переопределяли JWT_SECRET
+        inject_env .env JWT_KEYS ''
+        inject_env .env JWT_JWKS ''
+
         log "Supabase: dashboard credentials → user=$DASHBOARD_USERNAME pass=$DASHBOARD_PASSWORD"
         echo "$DASHBOARD_USERNAME:$DASHBOARD_PASSWORD" > "$SETUP_DIR/supabase_credentials.txt"
         chmod 600 "$SETUP_DIR/supabase_credentials.txt"
@@ -1388,6 +1482,14 @@ OVERRIDE_EOF
         inject_env .env SITE_URL            "$(env_esc "http://${ip}:${SUPABASE_PORT_STUDIO}")"
         inject_env .env SUPABASE_PUBLIC_URL "$(env_esc "http://${ip}:${SUPABASE_PORT_API}")"
     fi
+
+    # Валидация bind-mount файлов (файлы могли стать директориями)
+    supabase_validate_volumes || {
+        popd >/dev/null
+        dialog --title "Ошибка Supabase" \
+            --msgbox "Не удалось подготовить файлы volumes.\nЛог: $LOG_FILE" 7 60
+        return 1
+    }
 
     supabase_patch_compose
 
