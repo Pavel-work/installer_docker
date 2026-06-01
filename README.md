@@ -9,7 +9,7 @@ curl -fsSL "https://raw.githubusercontent.com/Pavel-work/installer_docker/main/i
 ______________________________________________________________________________________________________________________________________________________________________________________________________________________
 ОТ ОПУСА 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Pavel-work/installer_docker/main/ot_opusa.sh" | sudo bash -s
+curl -fsSL "https://raw.githubusercontent.com/Pavel-work/installer_docker/main/ot_opusa.sh" | sudo bash -s 
 ```
 ```bash
 Проверка после установки
